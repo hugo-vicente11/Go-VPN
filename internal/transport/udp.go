@@ -25,3 +25,24 @@ func New(port int, peerAddr string) (*Transport, error) {
 
 	return &Transport{conn: conn, peer: peer}, nil
 }
+
+func (t *Transport) Send(payload []byte) error {
+	_, err := t.conn.WriteToUDP(payload, t.peer)
+	if err != nil {
+		return fmt.Errorf("writing into UDP socket: %w", err)
+	}
+	return nil
+}
+
+func (t *Transport) Recv(buf []byte) (int, error) {
+	// TODO: validate sender == peer
+	n, err := t.conn.Read(buf)
+	if err != nil {
+		return 0, fmt.Errorf("receiving payload from UDP socket: %w", err)
+	}
+	return n, nil
+}
+
+func (t *Transport) Close() error {
+	return t.conn.Close()
+}
