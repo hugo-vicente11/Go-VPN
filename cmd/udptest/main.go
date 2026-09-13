@@ -44,5 +44,4 @@ func main() {
 		}
 		fmt.Printf("Read %d bytes\nPayload: %s\n", n, buf[:n])
 	}
-
 }
