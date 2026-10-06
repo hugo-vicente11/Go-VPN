@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/netip"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 
 	"github.com/hugo-vicente11/go-vpn/internal/transport"
 	"github.com/hugo-vicente11/go-vpn/internal/tun"
@@ -62,6 +66,9 @@ func flagErrorf(format string, args ...any) {
 }
 
 func run(port int, peer netip.AddrPort) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	var wg sync.WaitGroup
 	// Create TUN interface
 	dev, err := tun.New()
 	if err != nil {
@@ -76,20 +83,31 @@ func run(port int, peer netip.AddrPort) error {
 	}
 	defer t.Close()
 
-	recvBuf := make([]byte, 1500)
 	go func() {
+		<-ctx.Done()
+		dev.Close()
+		t.Close()
+	}()
+
+	recvBuf := make([]byte, 1500)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		for {
 			nRecv, err := t.Recv(recvBuf)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error while reading UDP payload")
+				if ctx.Err() != nil {
+					return
+				}
+				fmt.Fprintf(os.Stderr, "Error while reading UDP payload\n")
 				continue
 			}
 			nWrite, err := dev.Write(recvBuf[:nRecv])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error while writing into: %s", dev.Name())
+				fmt.Fprintf(os.Stderr, "Error while writing into: %s\n", dev.Name())
 			}
 			if nRecv != nWrite {
-				fmt.Fprintf(os.Stderr, "Did not write everything!")
+				fmt.Fprintf(os.Stderr, "Did not write everything!\n")
 			}
 		}
 	}()
@@ -98,13 +116,16 @@ func run(port int, peer netip.AddrPort) error {
 	for {
 		nRead, err := dev.Read(readBuf)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while reading from %s", dev.Name())
+			if ctx.Err() != nil {
+				wg.Wait()
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "Error while reading from %s\n", dev.Name())
 			continue
 		}
 		err = t.Send(readBuf[:nRead])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while sending UDP payload")
+			fmt.Fprintf(os.Stderr, "Error while sending UDP payload\n")
 		}
 	}
-
 }
