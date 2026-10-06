@@ -76,8 +76,35 @@ func run(port int, peer netip.AddrPort) error {
 	}
 	defer t.Close()
 
-	buf := make([]byte, 1500)
-	t.Recv(buf)
+	recvBuf := make([]byte, 1500)
+	go func() {
+		for {
+			nRecv, err := t.Recv(recvBuf)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error while reading UDP payload")
+				continue
+			}
+			nWrite, err := dev.Write(recvBuf[:nRecv])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error while writing into: %s", dev.Name())
+			}
+			if nRecv != nWrite {
+				fmt.Fprintf(os.Stderr, "Did not write everything!")
+			}
+		}
+	}()
 
-	return nil
+	readBuf := make([]byte, 1500)
+	for {
+		nRead, err := dev.Read(readBuf)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while reading from %s", dev.Name())
+			continue
+		}
+		err = t.Send(readBuf[:nRead])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while sending UDP payload")
+		}
+	}
+
 }
