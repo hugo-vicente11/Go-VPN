@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 
+	"github.com/hugo-vicente11/go-vpn/internal/transport"
 	"github.com/hugo-vicente11/go-vpn/internal/tun"
 )
 
@@ -45,21 +46,8 @@ Flags:
 		flagErrorf("-port must be between 1 and 65535, got %d", *port)
 	}
 
-	dev, err := tun.New()
-	if err != nil {
-		log.Fatalf("failed to create a tun device: %v", err)
-	}
-	defer dev.Close()
-	fmt.Printf("TUN device created: %s\n", dev.Name())
-	buf := make([]byte, 1500)
-
-	for {
-		n, err := dev.Read(buf)
-		if err != nil {
-			log.Fatalf("failed to read from tun device: %v", err)
-		}
-		fmt.Printf("Read %d bytes from tun\n", n)
-		fmt.Printf("Content read: \"% x\"\n", buf[:n])
+	if err := run(*port, peer); err != nil {
+		log.Fatal(err)
 	}
 
 }
@@ -71,4 +59,25 @@ func flagErrorf(format string, args ...any) {
 	fmt.Fprintf(w, "govpn: "+format+"\n\n", args...)
 	flag.Usage()
 	os.Exit(2)
+}
+
+func run(port int, peer netip.AddrPort) error {
+	// Create TUN interface
+	dev, err := tun.New()
+	if err != nil {
+		return fmt.Errorf("creating tun device: %w", err)
+	}
+	defer dev.Close()
+	fmt.Printf("TUN device created: %s\n", dev.Name())
+
+	t, err := transport.New(port, peer)
+	if err != nil {
+		return fmt.Errorf("creating UDP transport layer: %w", err)
+	}
+	defer t.Close()
+
+	buf := make([]byte, 1500)
+	t.Recv(buf)
+
+	return nil
 }
