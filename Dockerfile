@@ -1,4 +1,4 @@
-FROM golang:1.27.1
+FROM golang:1.27.1 AS build
 
 WORKDIR /govpn
 
@@ -6,6 +6,10 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o ./bin/govpn ./cmd/govpn
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o ./bin/govpn ./cmd/govpn
 
-CMD ["./bin/govpn"]
+FROM alpine:3.24.2
+WORKDIR /govpn
+COPY --from=build /govpn/bin/govpn ./bin/govpn
+
+ENTRYPOINT ["./bin/govpn"]
