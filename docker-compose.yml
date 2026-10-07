@@ -1,0 +1,31 @@
+services:
+  govpn-a:
+    build: .
+    image: go-vpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    command: ["-peer", "172.30.0.3:9000"]
+    networks:
+      vpn_net:
+        ipv4_address: 172.30.0.2
+
+  govpn-b:
+    build: .
+    image: go-vpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    command: ["-peer", "172.30.0.2:9000"]
+    networks:
+      vpn_net:
+        ipv4_address: 172.30.0.3
+
+networks:
+  vpn_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
