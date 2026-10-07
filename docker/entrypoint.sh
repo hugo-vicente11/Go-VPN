@@ -19,7 +19,7 @@ set -eu
         sleep 0.2
     done
 
-    echo "$iface appeared after $attempts attempts"
+    echo "$iface appeared after $attempts retries"
     echo "Adding $TUN_IP to $iface"
     ip addr add "$TUN_IP" dev "$iface"
     echo "Setting $iface UP"
