@@ -18,8 +18,9 @@ app -> tun0 -> govpn -> UDP -> govpn -> tun0 -> app
 ## Requirements
 
 - Linux
-- Go 1.27 or newer
+- Go 1.27 or newer (to build from source)
 - Root, or the `CAP_NET_ADMIN` capability (needed to create the TUN device)
+- Docker with Compose v2 (only for the Docker setup)
 
 ## Build
 
@@ -48,9 +49,42 @@ ip route add 10.0.1.0/24 dev tun0
 
 ## Try it locally
 
+### With Docker
+
+`docker-compose.yml` runs two peers on a private network (`172.30.0.0/24`). Each container creates its TUN device and configures its own address and route on startup:
+
+| Container | Network address | TUN address |
+|---|---|---|
+| `govpn-a` | `172.30.0.2` | `10.0.0.1/24` |
+| `govpn-b` | `172.30.0.3` | `10.0.1.1/24` |
+
+Start both peers:
+
+```
+docker compose up -d --build
+```
+
+Each container reports `(healthy)` once its TUN device has the expected address and route (about 30 seconds):
+
+```
+docker compose ps
+```
+
+Ping across the tunnel:
+
+```
+docker compose exec govpn-a ping -c1 10.0.1.1
+```
+
+Follow the logs with `docker compose logs`, and stop everything with `docker compose down`.
+
+The containers need the `NET_ADMIN` capability and the `/dev/net/tun` device, both already set in the compose file. A peer that exits with an error is restarted automatically.
+
+### With network namespaces
+
 `scripts/lab-up.sh` creates two network namespaces, `A` and `B`, connected by a virtual cable (`192.168.50.1` and `192.168.50.2`). Each namespace acts as a separate machine.
 
-Start the lab and one `govpn` per namespace, each in its own terminal:
+Build the binary (see [Build](#build)), then start the lab and one `govpn` per namespace, each in its own terminal:
 
 ```
 sudo ./scripts/lab-up.sh
@@ -86,10 +120,13 @@ Clean up with `sudo ./scripts/lab-down.sh`.
 | `cmd/udptest` | Standalone tool to test the UDP transport |
 | `internal/tun` | TUN device wrapper |
 | `internal/transport` | UDP transport |
+| `Dockerfile` | Multi-stage build of a minimal `govpn` image |
+| `docker-compose.yml` | Two-peer test setup |
+| `docker/entrypoint.sh` | Configures the TUN device inside the container, then starts `govpn` |
 | `scripts` | Network namespace test lab |
 
 ## Limitations
 
 - No encryption, authentication, or key exchange
 - Point-to-point only (one peer)
-- TUN addresses and routes are configured manually
+- Outside Docker, TUN addresses and routes are configured manually
