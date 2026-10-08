@@ -39,3 +39,14 @@ jobs:
           fi
       - name: Test
         run: go test ./... -race
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Image
+        run: docker build -t govpn:ci .
+      - name: Validate Docker Compose
+        run: docker compose config -q
+      - name: Smoke Test
+        run: docker run --rm --entrypoint ./bin/govpn govpn:ci -h
