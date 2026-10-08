@@ -99,15 +99,16 @@ func run(port int, peer netip.AddrPort) error {
 				if ctx.Err() != nil {
 					return
 				}
-				fmt.Fprintf(os.Stderr, "Error while reading UDP payload\n")
+				fmt.Fprintf(os.Stderr, "Error while reading UDP payload: %v\n", err)
 				continue
 			}
 			nWrite, err := dev.Write(recvBuf[:nRecv])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error while writing into: %s\n", dev.Name())
+				fmt.Fprintf(os.Stderr, "Error while writing into %s: %v\n", dev.Name(), err)
+				continue
 			}
 			if nRecv != nWrite {
-				fmt.Fprintf(os.Stderr, "Did not write everything!\n")
+				fmt.Fprintf(os.Stderr, "Did not write everything! wrote: %d expected %d\n", nWrite, nRecv)
 			}
 		}
 	}()
@@ -120,12 +121,12 @@ func run(port int, peer netip.AddrPort) error {
 				wg.Wait()
 				return nil
 			}
-			fmt.Fprintf(os.Stderr, "Error while reading from %s\n", dev.Name())
+			fmt.Fprintf(os.Stderr, "Error while reading from %s: %v\n", dev.Name(), err)
 			continue
 		}
 		err = t.Send(readBuf[:nRead])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while sending UDP payload\n")
+			fmt.Fprintf(os.Stderr, "Error while sending UDP payload: %v\n", err)
 		}
 	}
 }
