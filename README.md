@@ -1,5 +1,7 @@
 # Go-VPN
 
+[![CI](https://github.com/hugo-vicente11/Go-VPN/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hugo-vicente11/Go-VPN/actions/workflows/ci.yml)
+
 A point-to-point VPN written in Go. It tunnels IP packets between two hosts over UDP using a Linux TUN device.
 
 Built as a learning project. **Traffic is not encrypted yet. Do not use it to protect real data.**
