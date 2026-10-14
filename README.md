@@ -33,19 +33,20 @@ go build -o bin/govpn ./cmd/govpn
 ## Usage
 
 ```
-govpn -peer ip:port [-port port]
+govpn -peer ip:port -address ip/len [-port port]
 ```
 
 | Flag | Description | Default |
 |---|---|---|
 | `-peer` | Address of the other endpoint. Must be an IP, not a hostname. Required. | none |
+| `-address` | Tunnel address of this peer, with prefix length (e.g. `10.0.0.1/24`). Must be an IPv4 host address, not the network address, and not a `/32`. Required. | none |
 | `-port` | Local UDP port to listen on (1 to 65535). | `9000` |
 
-`govpn` creates the TUN device but does not configure it. After it starts, assign an address, bring the interface up, and add a route to the remote network:
+`govpn` creates the TUN device, assigns it the `-address`, and brings it up before it starts forwarding packets.
+
+If both peers' addresses are in the same subnet (for example `10.0.0.1/24` and `10.0.0.2/24`), nothing else is needed. If they are in different subnets, add a route to the remote subnet after `govpn` starts:
 
 ```
-ip addr add 10.0.0.1/24 dev tun0
-ip link set tun0 up
 ip route add 10.0.1.0/24 dev tun0
 ```
 
@@ -53,7 +54,7 @@ ip route add 10.0.1.0/24 dev tun0
 
 ### With Docker
 
-`docker-compose.yml` runs two peers on a private network (`172.30.0.0/24`). Each container creates its TUN device and configures its own address and route on startup:
+`docker-compose.yml` runs two peers on a private network (`172.30.0.0/24`). The peers' TUN addresses are in different subnets, so each container also adds a route to the other peer's subnet on startup:
 
 | Container | Network address | TUN address |
 |---|---|---|
@@ -90,26 +91,14 @@ Build the binary (see [Build](#build)), then start the lab and one `govpn` per n
 
 ```
 sudo ./scripts/lab-up.sh
-sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000
-sudo ip netns exec B ./bin/govpn -peer 192.168.50.1:9000
+sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24
+sudo ip netns exec B ./bin/govpn -peer 192.168.50.1:9000 -address 10.0.0.2/24
 ```
 
-Once both are running, configure the TUN devices in a third terminal:
+Both TUN addresses are in the same subnet, so no routes are needed. In a third terminal, ping across the tunnel:
 
 ```
-sudo ip netns exec A ip addr add 10.0.0.1/24 dev tun0
-sudo ip netns exec A ip link set tun0 up
-sudo ip netns exec A ip route add 10.0.1.0/24 dev tun0
-
-sudo ip netns exec B ip addr add 10.0.1.1/24 dev tun0
-sudo ip netns exec B ip link set tun0 up
-sudo ip netns exec B ip route add 10.0.0.0/24 dev tun0
-```
-
-Ping across the tunnel:
-
-```
-sudo ip netns exec A ping -c1 10.0.1.1
+sudo ip netns exec A ping -c1 10.0.0.2
 ```
 
 Clean up with `sudo ./scripts/lab-down.sh`.
@@ -124,11 +113,12 @@ Clean up with `sudo ./scripts/lab-down.sh`.
 | `internal/transport` | UDP transport |
 | `Dockerfile` | Multi-stage build of a minimal `govpn` image |
 | `docker-compose.yml` | Two-peer test setup |
-| `docker/entrypoint.sh` | Configures the TUN device inside the container, then starts `govpn` |
+| `docker/entrypoint.sh` | Starts `govpn` with the container's TUN address, and adds the route to the other peer's subnet once the TUN device is up |
 | `scripts` | Network namespace test lab |
 
 ## Limitations
 
 - No encryption, authentication, or key exchange
 - Point-to-point only (one peer)
-- Outside Docker, TUN addresses and routes are configured manually
+- IPv4 only
+- Outside Docker, routes to a different remote subnet are added manually

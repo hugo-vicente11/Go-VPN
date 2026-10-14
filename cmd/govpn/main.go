@@ -18,18 +18,22 @@ import (
 func main() {
 	// Parsing command line arguments
 	var peer netip.AddrPort
+	var address netip.Prefix
 	flag.TextVar(&peer, "peer", netip.AddrPort{}, "peer to exchange messages with, as `ip:port`")
 	port := flag.Int("port", 9000, "local UDP `port` to listen on, must be between 1 and 65535")
+	flag.TextVar(&address, "address", netip.Prefix{}, "tunnel address of this peer, as `ip/len` (e.g. 10.0.0.1/24)")
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
 		fmt.Fprint(w, `govpn creates a Virtual Private Network so you can safely communicate with
 other peers.
 
 Usage:
-  govpn -peer ip:port [-port port]
+  govpn -peer ip:port -address ip/len [-port port]
 
-Example:
-  ./bin/govpn -peer 192.168.50.2:9000
+Example (two-namespace lab, see scripts/lab-up.sh):
+  sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24
+  sudo ip netns exec B ./bin/govpn -peer 192.168.50.1:9000 -address 10.0.0.2/24
+  sudo ip netns exec A ping 10.0.0.2
 
 Flags:
 `)
@@ -46,11 +50,15 @@ Flags:
 		flagErrorf("-peer is required")
 	}
 
+	if err := validateTunnelAddr(address); err != nil {
+		flagErrorf("-address %v", err)
+	}
+
 	if *port < 1 || *port > 65535 {
 		flagErrorf("-port must be between 1 and 65535, got %d", *port)
 	}
 
-	if err := run(*port, peer); err != nil {
+	if err := run(*port, peer, address); err != nil {
 		log.Fatal(err)
 	}
 
@@ -65,7 +73,7 @@ func flagErrorf(format string, args ...any) {
 	os.Exit(2)
 }
 
-func run(port int, peer netip.AddrPort) error {
+func run(port int, peer netip.AddrPort, addr netip.Prefix) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var wg sync.WaitGroup
@@ -75,6 +83,11 @@ func run(port int, peer netip.AddrPort) error {
 		return fmt.Errorf("creating tun device: %w", err)
 	}
 	defer dev.Close()
+
+	if err = dev.Configure(addr); err != nil {
+		return fmt.Errorf("configuring tun device: %w", err)
+	}
+
 	fmt.Printf("TUN device created: %s\n", dev.Name())
 
 	t, err := transport.New(port, peer)
@@ -129,4 +142,25 @@ func run(port int, peer netip.AddrPort) error {
 			fmt.Fprintf(os.Stderr, "Error while sending UDP payload: %v\n", err)
 		}
 	}
+}
+
+// validateTunnelAddr reports an error if p cannot be used as this peer's tunnel address.
+func validateTunnelAddr(p netip.Prefix) error {
+	if !p.IsValid() {
+		return fmt.Errorf("is required")
+	}
+
+	if !p.Addr().Is4() {
+		return fmt.Errorf("must be IPv4, got %s", p.Addr())
+	}
+
+	if p.Bits() == 32 {
+		return fmt.Errorf("/32 leaves no room for the peer")
+	}
+
+	if p.Bits() <= 30 && p.Masked() == p {
+		return fmt.Errorf("%s is a network address, use a host address such as %s", p, netip.PrefixFrom(p.Addr().Next(), p.Bits()))
+	}
+
+	return nil
 }
