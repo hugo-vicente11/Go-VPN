@@ -42,7 +42,18 @@ govpn -peer ip:port -address ip/len [-port port]
 | `-address` | Tunnel address of this peer, with prefix length (e.g. `10.0.0.1/24`). Must be an IPv4 host address, not the network address, and not a `/32`. Required. | none |
 | `-port` | Local UDP port to listen on (1 to 65535). | `9000` |
 
-`govpn` creates the TUN device, assigns it the `-address`, and brings it up before it starts forwarding packets.
+`govpn` creates the TUN device, assigns it the `-address`, sets its MTU to 1420, and brings it up before it starts forwarding packets.
+
+The MTU leaves room for the headers added to each tunneled packet, so the outer packet still fits in a standard 1500-byte link:
+
+| Header | Bytes |
+|---|---|
+| Outer IP (IPv6, the worst case) | 40 |
+| UDP | 8 |
+| Tunnel header and authentication tag | 32 |
+| **TUN MTU** | 1500 − 80 = **1420** |
+
+The 32 bytes for the tunnel header and tag are reserved for encryption, which is not implemented yet.
 
 If both peers' addresses are in the same subnet (for example `10.0.0.1/24` and `10.0.0.2/24`), nothing else is needed. If they are in different subnets, add a route to the remote subnet after `govpn` starts:
 
@@ -101,6 +112,13 @@ Both TUN addresses are in the same subnet, so no routes are needed. In a third t
 sudo ip netns exec A ping -c1 10.0.0.2
 ```
 
+To check the MTU, send pings with the "don't fragment" bit set. 1392 bytes of ICMP payload plus 8 bytes of ICMP header and 20 bytes of IPv4 header is exactly 1420, so the first ping goes through and the second is rejected locally with `message too long`:
+
+```
+sudo ip netns exec A ping -c1 -M do -s 1392 10.0.0.2
+sudo ip netns exec A ping -c1 -M do -s 1393 10.0.0.2
+```
+
 Clean up with `sudo ./scripts/lab-down.sh`.
 
 ## Project layout
@@ -121,4 +139,5 @@ Clean up with `sudo ./scripts/lab-down.sh`.
 - No encryption, authentication, or key exchange
 - Point-to-point only (one peer)
 - IPv4 only
+- The TUN MTU assumes the underlying link has a 1500-byte MTU
 - Outside Docker, routes to a different remote subnet are added manually
