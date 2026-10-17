@@ -15,6 +15,15 @@ import (
 	"github.com/hugo-vicente11/go-vpn/internal/tun"
 )
 
+const (
+	ethernetMTU    = 1500
+	ipv6Size       = 40
+	udpOverhead    = 8
+	cryptoOverhead = 32 // 16 bytes header + 16 bytes tag
+	tunnelMTU      = ethernetMTU - ipv6Size - udpOverhead - cryptoOverhead
+	udpPayloadSize = ethernetMTU - ipv6Size - udpOverhead
+)
+
 func main() {
 	// Parsing command line arguments
 	var peer netip.AddrPort
@@ -84,7 +93,7 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix) error {
 	}
 	defer dev.Close()
 
-	if err = dev.Configure(addr); err != nil {
+	if err = dev.Configure(addr, tunnelMTU); err != nil {
 		return fmt.Errorf("configuring tun device: %w", err)
 	}
 
@@ -102,7 +111,7 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix) error {
 		t.Close()
 	}()
 
-	recvBuf := make([]byte, 1500)
+	recvBuf := make([]byte, udpPayloadSize)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -126,7 +135,7 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix) error {
 		}
 	}()
 
-	readBuf := make([]byte, 1500)
+	readBuf := make([]byte, udpPayloadSize)
 	for {
 		nRead, err := dev.Read(readBuf)
 		if err != nil {

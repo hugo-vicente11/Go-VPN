@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os/exec"
+	"strconv"
 
 	"github.com/songgao/water"
 )
@@ -43,11 +44,16 @@ func (d *Device) Name() string {
 	return d.iface.Name()
 }
 
-// Configure assigns addr to the device and brings it up.
-func (d *Device) Configure(addr netip.Prefix) error {
+// Configure assigns addr to the device, sets the MTU and brings it up.
+func (d *Device) Configure(addr netip.Prefix, mtu int) error {
 	cmd := exec.Command("ip", "addr", "add", addr.String(), "dev", d.Name())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("adding address %s to %s: %s: %w", addr.String(), d.Name(), bytes.TrimSpace(out), err)
+	}
+
+	cmd = exec.Command("ip", "link", "set", "dev", d.Name(), "mtu", strconv.Itoa(mtu))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("setting %s MTU to %d: %s: %w", d.Name(), mtu, bytes.TrimSpace(out), err)
 	}
 
 	cmd = exec.Command("ip", "link", "set", "dev", d.Name(), "up")
