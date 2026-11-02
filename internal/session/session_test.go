@@ -2,8 +2,10 @@ package session
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -12,6 +14,10 @@ import (
 var (
 	testKey  = [32]byte{1, 2, 3}
 	otherKey = [32]byte{4, 5, 6}
+
+	// testKeyB64 is a key in the format wg genkey produces, written by hand.
+	// It decodes to the bytes 0 to 31 (see testKeyB64Bytes), not to testKey.
+	testKeyB64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 )
 
 // newTestSession returns a Session for key, failing the test if it cannot be created.
@@ -184,5 +190,60 @@ func TestOpenRejectsWrongKey(t *testing.T) {
 
 	if _, err := newTestSession(t, otherKey).Open(nil, msg); !errors.Is(err, ErrAuth) {
 		t.Errorf("Open: error = %v, want %v", err, ErrAuth)
+	}
+}
+
+// testKeyB64Bytes returns the key that testKeyB64 encodes: the bytes 0 to 31.
+func testKeyB64Bytes() [32]byte {
+	var key [32]byte
+	for i := range key {
+		key[i] = byte(i)
+	}
+	return key
+}
+
+func TestParseKey(t *testing.T) {
+	want := testKeyB64Bytes()
+
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"valid", testKeyB64, false},
+		{"trailing newline", testKeyB64 + "\n", false},
+		{"surrounding whitespace", "  " + testKeyB64 + "\t", false},
+		{"invalid base64", "not base64!", true},
+		{"missing padding", strings.TrimSuffix(testKeyB64, "="), true},
+		{"too short", base64.StdEncoding.EncodeToString(make([]byte, 16)), true},
+		{"too long", base64.StdEncoding.EncodeToString(make([]byte, 33)), true},
+		{"empty", "", true},
+		{"only whitespace", "\n", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseKey(tc.input)
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Fatalf("ParseKey(%q) error = %v, wantErr %v", tc.input, err, tc.wantErr)
+			}
+			if !tc.wantErr && got != want {
+				t.Errorf("ParseKey(%q) = %x, want %x", tc.input, got, want)
+			}
+		})
+	}
+}
+
+// TestParseKeyErrorContext checks that ParseKey's errors say they come from
+// this package, so a user can tell a bad key file from other failures.
+func TestParseKeyErrorContext(t *testing.T) {
+	for _, input := range []string{"not base64!", ""} {
+		_, err := ParseKey(input)
+		if err == nil {
+			t.Fatalf("ParseKey(%q) returned nil error, want an error", input)
+		}
+		if msg := err.Error(); !strings.HasPrefix(msg, "session: ") {
+			t.Errorf("ParseKey(%q) error = %q, want it to start with %q", input, msg, "session: ")
+		}
 	}
 }

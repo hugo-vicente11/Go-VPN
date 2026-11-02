@@ -2,9 +2,12 @@ package session
 
 import (
 	"crypto/cipher"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
+	"strings"
 	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -102,6 +105,27 @@ func (s *Session) Open(dst, msg []byte) ([]byte, error) {
 	if err != nil {
 		return nil, ErrAuth
 	}
+
+	return res, nil
+}
+
+// ParseKey decodes a key in standard base64 with padding, the format
+// produced by wg genkey. Surrounding whitespace, such as a trailing newline
+// from a key file, is ignored. It returns an error if s is not valid base64
+// or does not decode to exactly chacha20poly1305.KeySize bytes.
+func ParseKey(s string) ([chacha20poly1305.KeySize]byte, error) {
+	s = strings.TrimSpace(s)
+	key, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return [chacha20poly1305.KeySize]byte{}, fmt.Errorf("session: key is not valid base64: %w", err)
+	}
+
+	if len(key) != chacha20poly1305.KeySize {
+		return [chacha20poly1305.KeySize]byte{}, fmt.Errorf("session: invalid key length: expected %d bytes, got %d", chacha20poly1305.KeySize, len(key))
+	}
+
+	var res [chacha20poly1305.KeySize]byte
+	copy(res[:], key)
 
 	return res, nil
 }
