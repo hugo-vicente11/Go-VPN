@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/netip"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/hugo-vicente11/go-vpn/internal/session"
 	"github.com/hugo-vicente11/go-vpn/internal/transport"
 	"github.com/hugo-vicente11/go-vpn/internal/tun"
 )
@@ -19,7 +21,7 @@ const (
 	ethernetMTU    = 1500
 	ipv6Size       = 40
 	udpOverhead    = 8
-	cryptoOverhead = 32 // 16 bytes header + 16 bytes tag
+	cryptoOverhead = session.Overhead
 	tunnelMTU      = ethernetMTU - ipv6Size - udpOverhead - cryptoOverhead
 	udpPayloadSize = ethernetMTU - ipv6Size - udpOverhead
 )
@@ -31,17 +33,18 @@ func main() {
 	flag.TextVar(&peer, "peer", netip.AddrPort{}, "peer to exchange messages with, as `ip:port`")
 	port := flag.Int("port", 9000, "local UDP `port` to listen on, must be between 1 and 65535")
 	flag.TextVar(&address, "address", netip.Prefix{}, "tunnel address of this peer, as `ip/len` (e.g. 10.0.0.1/24)")
+	keyFile := flag.String("key-file", "", "`path` to the base64 key file, readable only by its owner")
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
 		fmt.Fprint(w, `govpn creates a Virtual Private Network so you can safely communicate with
 other peers.
 
 Usage:
-  govpn -peer ip:port -address ip/len [-port port]
+  govpn -peer ip:port -address ip/len -key-file path [-port port]
 
 Example (two-namespace lab, see scripts/lab-up.sh):
-  sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24
-  sudo ip netns exec B ./bin/govpn -peer 192.168.50.1:9000 -address 10.0.0.2/24
+  sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24 -key-file govpn.key
+  sudo ip netns exec B ./bin/govpn -peer 192.168.50.1:9000 -address 10.0.0.2/24 -key-file govpn.key
   sudo ip netns exec A ping 10.0.0.2
 
 Flags:
@@ -59,6 +62,10 @@ Flags:
 		flagErrorf("-peer is required")
 	}
 
+	if *keyFile == "" {
+		flagErrorf("-key-file is required")
+	}
+
 	if err := validateTunnelAddr(address); err != nil {
 		flagErrorf("-address %v", err)
 	}
@@ -67,7 +74,7 @@ Flags:
 		flagErrorf("-port must be between 1 and 65535, got %d", *port)
 	}
 
-	if err := run(*port, peer, address); err != nil {
+	if err := run(*port, peer, address, *keyFile); err != nil {
 		log.Fatal(err)
 	}
 
@@ -82,10 +89,21 @@ func flagErrorf(format string, args ...any) {
 	os.Exit(2)
 }
 
-func run(port int, peer netip.AddrPort, addr netip.Prefix) error {
+func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var wg sync.WaitGroup
+
+	key, err := loadKey(keyFile)
+	if err != nil {
+		return err
+	}
+
+	s, err := session.New(key)
+	if err != nil {
+		return fmt.Errorf("creating session: %w", err)
+	}
+
 	// Create TUN interface
 	dev, err := tun.New()
 	if err != nil {
@@ -124,20 +142,32 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix) error {
 				fmt.Fprintf(os.Stderr, "Error while reading UDP payload: %v\n", err)
 				continue
 			}
-			nWrite, err := dev.Write(recvBuf[:nRecv])
+			packet, err := s.Open(recvBuf[session.HeaderSize:session.HeaderSize], recvBuf[:nRecv])
+			if err != nil {
+				// Drop invalid messages silently. Anyone can send datagrams to
+				// this port, so logging each one would let them flood the logs.
+				continue
+			}
+
+			if len(packet) == 0 {
+				// An empty packet is a keepalive: it only shows the peer is alive,
+				// so there is nothing to write to the TUN device.
+				continue
+			}
+			nWrite, err := dev.Write(packet)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error while writing into %s: %v\n", dev.Name(), err)
 				continue
 			}
-			if nRecv != nWrite {
-				fmt.Fprintf(os.Stderr, "Did not write everything! wrote: %d expected %d\n", nWrite, nRecv)
+			if len(packet) != nWrite {
+				fmt.Fprintf(os.Stderr, "Did not write everything! wrote: %d expected %d\n", nWrite, len(packet))
 			}
 		}
 	}()
 
 	readBuf := make([]byte, udpPayloadSize)
 	for {
-		nRead, err := dev.Read(readBuf)
+		nRead, err := dev.Read(readBuf[session.HeaderSize:])
 		if err != nil {
 			if ctx.Err() != nil {
 				wg.Wait()
@@ -146,7 +176,13 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix) error {
 			fmt.Fprintf(os.Stderr, "Error while reading from %s: %v\n", dev.Name(), err)
 			continue
 		}
-		err = t.Send(readBuf[:nRead])
+		msg, err := s.Seal(readBuf[:0], readBuf[session.HeaderSize:session.HeaderSize+nRead])
+		if err != nil {
+			stop()
+			wg.Wait()
+			return fmt.Errorf("sealing packet: %w", err)
+		}
+		err = t.Send(msg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error while sending UDP payload: %v\n", err)
 		}
@@ -172,4 +208,38 @@ func validateTunnelAddr(p netip.Prefix) error {
 	}
 
 	return nil
+}
+
+// loadKey reads the key from the file at path. It refuses files that group
+// or others can access, because anyone who can read the key can decrypt
+// the tunnel.
+func loadKey(path string) (session.Key, error) {
+	// Check and read the same open file, so it cannot be swapped in between.
+	f, err := os.Open(path)
+	if err != nil {
+		return session.Key{}, fmt.Errorf("opening key file: %w", err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return session.Key{}, fmt.Errorf("checking key file: %w", err)
+	}
+
+	perms := info.Mode().Perm()
+	if perms&0o077 != 0 {
+		return session.Key{}, fmt.Errorf("key file %s is accessible by other users (mode %#o); run: chmod 600 %s", path, perms, path)
+	}
+
+	fileContents, err := io.ReadAll(f)
+	if err != nil {
+		return session.Key{}, fmt.Errorf("reading key file: %w", err)
+	}
+
+	key, err := session.ParseKey(string(fileContents))
+	if err != nil {
+		return session.Key{}, fmt.Errorf("key file %s: %w", path, err)
+	}
+
+	return key, nil
 }

@@ -1,3 +1,7 @@
+secrets:
+  govpn_key:
+    file: ./govpn.key
+
 services:
   govpn-a:
     build: .
@@ -20,6 +24,7 @@ services:
     networks:
       vpn_net:
         ipv4_address: 172.30.0.2
+    secrets: [govpn_key]
 
   govpn-b:
     build: .
@@ -42,6 +47,7 @@ services:
     networks:
       vpn_net:
         ipv4_address: 172.30.0.3
+    secrets: [govpn_key]
 
 networks:
   vpn_net:

@@ -25,4 +25,4 @@ set -eu
     echo "Route to $REMOTE_NET via $iface added"
 ) &
 
-exec ./bin/govpn -address "$TUN_IP" "$@"
+exec ./bin/govpn -address "$TUN_IP" -key-file "${KEY_FILE:-/run/secrets/govpn_key}" "$@"
