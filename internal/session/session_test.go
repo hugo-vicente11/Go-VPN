@@ -12,8 +12,8 @@ import (
 )
 
 var (
-	testKey  = [32]byte{1, 2, 3}
-	otherKey = [32]byte{4, 5, 6}
+	testKey  = Key{1, 2, 3}
+	otherKey = Key{4, 5, 6}
 
 	// testKeyB64 is a key in the format wg genkey produces, written by hand.
 	// It decodes to the bytes 0 to 31 (see testKeyB64Bytes), not to testKey.
@@ -21,7 +21,7 @@ var (
 )
 
 // newTestSession returns a Session for key, failing the test if it cannot be created.
-func newTestSession(t *testing.T, key [32]byte) *Session {
+func newTestSession(t *testing.T, key Key) *Session {
 	t.Helper()
 	s, err := New(key)
 	if err != nil {
@@ -45,7 +45,7 @@ func TestSealOpenRoundTrip(t *testing.T) {
 	packet := []byte("hello")
 
 	msg := seal(t, s, packet)
-	if want := len(packet) + minimumMessageSize; len(msg) != want {
+	if want := len(packet) + Overhead; len(msg) != want {
 		t.Errorf("len(msg) = %d, want %d", len(msg), want)
 	}
 
@@ -96,8 +96,8 @@ func TestOpenAcceptsKeepalive(t *testing.T) {
 	s := newTestSession(t, testKey)
 
 	msg := seal(t, s, nil)
-	if len(msg) != minimumMessageSize {
-		t.Errorf("len(msg) = %d, want %d", len(msg), minimumMessageSize)
+	if len(msg) != Overhead {
+		t.Errorf("len(msg) = %d, want %d", len(msg), Overhead)
 	}
 
 	got, err := s.Open(nil, msg)
@@ -117,14 +117,14 @@ func TestSealIncrementsCounter(t *testing.T) {
 	second := seal(t, s, packet)
 
 	for i, msg := range [][]byte{first, second} {
-		got := binary.LittleEndian.Uint64(msg[counterOffset:headerSize])
+		got := binary.LittleEndian.Uint64(msg[counterOffset:HeaderSize])
 		if want := uint64(i); got != want {
 			t.Errorf("message %d: counter = %d, want %d", i, got, want)
 		}
 	}
 
 	// The same packet sealed with a different nonce must not produce the same ciphertext.
-	if bytes.Equal(first[headerSize:], second[headerSize:]) {
+	if bytes.Equal(first[HeaderSize:], second[HeaderSize:]) {
 		t.Error("sealing the same packet twice produced identical ciphertexts")
 	}
 }
@@ -147,7 +147,7 @@ func TestSealCounterExhausted(t *testing.T) {
 func TestOpenRejectsShortMessage(t *testing.T) {
 	s := newTestSession(t, testKey)
 
-	for _, n := range []int{0, 1, headerSize - 1, minimumMessageSize - 1} {
+	for _, n := range []int{0, 1, HeaderSize - 1, Overhead - 1} {
 		if _, err := s.Open(nil, make([]byte, n)); !errors.Is(err, ErrShort) {
 			t.Errorf("Open(%d bytes): error = %v, want %v", n, err, ErrShort)
 		}
@@ -169,7 +169,7 @@ func TestOpenRejectsTampered(t *testing.T) {
 		{"reserved", 1, ErrType},
 		{"receiver index", receiverOffset, ErrType},
 		{"counter", counterOffset, ErrAuth},
-		{"ciphertext", headerSize, ErrAuth},
+		{"ciphertext", HeaderSize, ErrAuth},
 		{"tag", len(msg) - 1, ErrAuth},
 	}
 
@@ -194,8 +194,8 @@ func TestOpenRejectsWrongKey(t *testing.T) {
 }
 
 // testKeyB64Bytes returns the key that testKeyB64 encodes: the bytes 0 to 31.
-func testKeyB64Bytes() [32]byte {
-	var key [32]byte
+func testKeyB64Bytes() Key {
+	var key Key
 	for i := range key {
 		key[i] = byte(i)
 	}

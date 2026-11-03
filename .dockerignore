@@ -3,3 +3,4 @@ scripts/
 build/
 bin/
 .git
+*.key

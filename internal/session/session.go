@@ -20,14 +20,19 @@ type Session struct {
 	counter atomic.Uint64
 }
 
+// Key is a symmetric key for sealing and opening transport data messages.
+type Key [chacha20poly1305.KeySize]byte
+
 const (
-	messageType        = 4
-	headerSize         = 16
-	receiverOffset     = 4
-	counterOffset      = 8
-	receiverIndex      = 0
-	minimumMessageSize = headerSize + chacha20poly1305.Overhead
-	counterLimit       = math.MaxUint64 - (1 << 13)
+	messageType = 4
+	// HeaderSize is the size of a transport data message header.
+	HeaderSize     = 16
+	receiverOffset = 4
+	counterOffset  = 8
+	receiverIndex  = 0
+	// Overhead is the number of bytes Seal adds to a packet: the header and the tag.
+	Overhead     = HeaderSize + chacha20poly1305.Overhead
+	counterLimit = math.MaxUint64 - (1 << 13)
 )
 
 // Errors returned by Open and Seal.
@@ -45,7 +50,11 @@ var (
 )
 
 // New returns a Session that seals and opens messages with key.
-func New(key [32]byte) (*Session, error) {
+//
+// Nonces are unique only within one Session. Two Sessions that seal with
+// the same key, such as the two ends of a tunnel, reuse nonces, which breaks
+// ChaCha20-Poly1305. Each direction needs its own key; this is not done yet.
+func New(key Key) (*Session, error) {
 	aead, err := chacha20poly1305.New(key[:])
 	if err != nil {
 		return nil, err
@@ -87,7 +96,7 @@ func (s *Session) Seal(dst, packet []byte) ([]byte, error) {
 // It returns ErrShort, ErrType, or ErrAuth if msg is invalid. Callers
 // should drop invalid messages without replying.
 func (s *Session) Open(dst, msg []byte) ([]byte, error) {
-	if len(msg) < minimumMessageSize {
+	if len(msg) < Overhead {
 		return nil, ErrShort
 	}
 
@@ -99,9 +108,9 @@ func (s *Session) Open(dst, msg []byte) ([]byte, error) {
 		return nil, ErrType
 	}
 
-	nonce := makeNonce(binary.LittleEndian.Uint64(msg[counterOffset:headerSize]))
+	nonce := makeNonce(binary.LittleEndian.Uint64(msg[counterOffset:HeaderSize]))
 
-	res, err := s.aead.Open(dst, nonce[:], msg[headerSize:], nil)
+	res, err := s.aead.Open(dst, nonce[:], msg[HeaderSize:], nil)
 	if err != nil {
 		return nil, ErrAuth
 	}
@@ -113,18 +122,18 @@ func (s *Session) Open(dst, msg []byte) ([]byte, error) {
 // produced by wg genkey. Surrounding whitespace, such as a trailing newline
 // from a key file, is ignored. It returns an error if s is not valid base64
 // or does not decode to exactly chacha20poly1305.KeySize bytes.
-func ParseKey(s string) ([chacha20poly1305.KeySize]byte, error) {
+func ParseKey(s string) (Key, error) {
 	s = strings.TrimSpace(s)
 	key, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		return [chacha20poly1305.KeySize]byte{}, fmt.Errorf("session: key is not valid base64: %w", err)
+		return Key{}, fmt.Errorf("session: key is not valid base64: %w", err)
 	}
 
 	if len(key) != chacha20poly1305.KeySize {
-		return [chacha20poly1305.KeySize]byte{}, fmt.Errorf("session: invalid key length: expected %d bytes, got %d", chacha20poly1305.KeySize, len(key))
+		return Key{}, fmt.Errorf("session: invalid key length: expected %d bytes, got %d", chacha20poly1305.KeySize, len(key))
 	}
 
-	var res [chacha20poly1305.KeySize]byte
+	var res Key
 	copy(res[:], key)
 
 	return res, nil
