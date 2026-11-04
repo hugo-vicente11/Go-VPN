@@ -99,7 +99,7 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string) error
 		return err
 	}
 
-	s, err := session.New(key)
+	s, err := session.New(key, key)
 	if err != nil {
 		return fmt.Errorf("creating session: %w", err)
 	}

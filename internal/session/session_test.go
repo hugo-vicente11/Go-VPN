@@ -20,10 +20,11 @@ var (
 	testKeyB64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 )
 
-// newTestSession returns a Session for key, failing the test if it cannot be created.
+// newTestSession returns a Session that uses key in both directions, so it can
+// open its own messages. It fails the test if the Session cannot be created.
 func newTestSession(t *testing.T, key Key) *Session {
 	t.Helper()
-	s, err := New(key)
+	s, err := New(key, key)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -67,7 +68,7 @@ func TestSealKnownAnswer(t *testing.T) {
 	packet := []byte("hi")
 
 	// Every byte of the counter is different, so a byte in the wrong place shows up.
-	s.counter.Store(0x0102030405060708)
+	s.sendCounter.Store(0x0102030405060708)
 	got := seal(t, s, packet)
 
 	header := []byte{
@@ -133,7 +134,7 @@ func TestSealCounterExhausted(t *testing.T) {
 	s := newTestSession(t, testKey)
 
 	// The last counter value below the limit is still usable.
-	s.counter.Store(counterLimit - 1)
+	s.sendCounter.Store(counterLimit - 1)
 	if _, err := s.Seal(nil, []byte("hello")); err != nil {
 		t.Fatalf("Seal at counter %d: %v", uint64(counterLimit-1), err)
 	}
@@ -191,6 +192,58 @@ func TestOpenRejectsWrongKey(t *testing.T) {
 	if _, err := newTestSession(t, otherKey).Open(nil, msg); !errors.Is(err, ErrAuth) {
 		t.Errorf("Open: error = %v, want %v", err, ErrAuth)
 	}
+}
+
+// TestSessionPair checks two Sessions set up as the two ends of a tunnel,
+// each sealing with the key the other opens with.
+func TestSessionPair(t *testing.T) {
+	newSession := func(send, recv Key) *Session {
+		t.Helper()
+		s, err := New(send, recv)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return s
+	}
+	a := newSession(testKey, otherKey)
+	b := newSession(otherKey, testKey)
+	packet := []byte("hello")
+
+	fromA := seal(t, a, packet)
+	fromB := seal(t, b, packet)
+
+	t.Run("each side opens the other's message", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			s    *Session
+			msg  []byte
+		}{
+			{"b opens a", b, fromA},
+			{"a opens b", a, fromB},
+		} {
+			got, err := tc.s.Open(nil, tc.msg)
+			if err != nil {
+				t.Fatalf("%s: Open: %v", tc.name, err)
+			}
+			if !bytes.Equal(got, packet) {
+				t.Errorf("%s: Open = %q, want %q", tc.name, got, packet)
+			}
+		}
+	})
+
+	t.Run("a side cannot open its own message", func(t *testing.T) {
+		if _, err := a.Open(nil, fromA); !errors.Is(err, ErrAuth) {
+			t.Errorf("Open: error = %v, want %v", err, ErrAuth)
+		}
+	})
+
+	// Both messages use counter 0. With one shared key they would be sealed
+	// with the same key and nonce, and the ciphertexts would be identical.
+	t.Run("same counter gives different ciphertexts", func(t *testing.T) {
+		if bytes.Equal(fromA[HeaderSize:], fromB[HeaderSize:]) {
+			t.Error("both directions produced the same ciphertext for the same counter and packet")
+		}
+	})
 }
 
 // testKeyB64Bytes returns the key that testKeyB64 encodes: the bytes 0 to 31.
