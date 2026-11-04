@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -24,7 +25,14 @@ var (
 // open its own messages. It fails the test if the Session cannot be created.
 func newTestSession(t *testing.T, key Key) *Session {
 	t.Helper()
-	s, err := New(key, key)
+	return newSession(t, key, key)
+}
+
+// newSession returns a Session that seals with send and opens with recv. It
+// fails the test if the Session cannot be created.
+func newSession(t *testing.T, send, recv Key) *Session {
+	t.Helper()
+	s, err := New(send, recv)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -197,16 +205,15 @@ func TestOpenRejectsWrongKey(t *testing.T) {
 // TestSessionPair checks two Sessions set up as the two ends of a tunnel,
 // each sealing with the key the other opens with.
 func TestSessionPair(t *testing.T) {
-	newSession := func(send, recv Key) *Session {
-		t.Helper()
-		s, err := New(send, recv)
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
-		return s
-	}
-	a := newSession(testKey, otherKey)
-	b := newSession(otherKey, testKey)
+	a := newSession(t, testKey, otherKey)
+	b := newSession(t, otherKey, testKey)
+	checkSessionPair(t, a, b)
+}
+
+// checkSessionPair checks that a and b work as the two ends of a tunnel. Both
+// must be new, so their first messages use the same counter.
+func checkSessionPair(t *testing.T, a, b *Session) {
+	t.Helper()
 	packet := []byte("hello")
 
 	fromA := seal(t, a, packet)
@@ -244,6 +251,78 @@ func TestSessionPair(t *testing.T) {
 			t.Error("both directions produced the same ciphertext for the same counter and packet")
 		}
 	})
+}
+
+// deriveKeys calls DeriveKeys, failing the test on error.
+func deriveKeys(t *testing.T, shared Key, initiator bool) (send, recv Key) {
+	t.Helper()
+	send, recv, err := DeriveKeys(shared, initiator)
+	if err != nil {
+		t.Fatalf("DeriveKeys(initiator=%v): %v", initiator, err)
+	}
+	return send, recv
+}
+
+func TestDeriveKeys(t *testing.T) {
+	iSend, iRecv := deriveKeys(t, testKey, true)
+	rSend, rRecv := deriveKeys(t, testKey, false)
+
+	if iSend != rRecv {
+		t.Errorf("initiator send key %x != responder receive key %x", iSend, rRecv)
+	}
+	if iRecv != rSend {
+		t.Errorf("initiator receive key %x != responder send key %x", iRecv, rSend)
+	}
+	if iSend == iRecv {
+		t.Errorf("send and receive keys are both %x, want one key for each direction", iSend)
+	}
+	for _, k := range []Key{iSend, iRecv} {
+		if k == testKey {
+			t.Errorf("derived key %x is the shared key", k)
+		}
+	}
+
+	otherSend, otherRecv := deriveKeys(t, otherKey, true)
+	if otherSend == iSend || otherRecv == iRecv {
+		t.Error("different shared keys derived the same keys")
+	}
+}
+
+// TestDeriveKeysKnownAnswer checks DeriveKeys against keys computed outside
+// Go, with HKDF-SHA256 written by hand from RFC 5869. The other tests only
+// compare derived keys with each other, so they cannot catch a change that
+// alters both directions, such as a new hash, salt, or label. Peers running
+// different versions would then derive different keys.
+func TestDeriveKeysKnownAnswer(t *testing.T) {
+	want := map[bool]struct{ send, recv string }{
+		true: {
+			send: "3b38df6ff2f8a6119c1d913318e8ad091da1097d89814a42f279ff2e45f4cba0",
+			recv: "febd29c9d4f4ffb13f6b1d2bff5b1ef67c27e298a07d0511add117eb7fc05b22",
+		},
+		false: {
+			send: "febd29c9d4f4ffb13f6b1d2bff5b1ef67c27e298a07d0511add117eb7fc05b22",
+			recv: "3b38df6ff2f8a6119c1d913318e8ad091da1097d89814a42f279ff2e45f4cba0",
+		},
+	}
+
+	for _, initiator := range []bool{true, false} {
+		send, recv := deriveKeys(t, testKeyB64Bytes(), initiator)
+		if got := hex.EncodeToString(send[:]); got != want[initiator].send {
+			t.Errorf("DeriveKeys(initiator=%v) send = %s, want %s", initiator, got, want[initiator].send)
+		}
+		if got := hex.EncodeToString(recv[:]); got != want[initiator].recv {
+			t.Errorf("DeriveKeys(initiator=%v) recv = %s, want %s", initiator, got, want[initiator].recv)
+		}
+	}
+}
+
+// TestDerivedSessionPair checks that Sessions built from DeriveKeys work as
+// the two ends of a tunnel.
+func TestDerivedSessionPair(t *testing.T) {
+	iSend, iRecv := deriveKeys(t, testKey, true)
+	rSend, rRecv := deriveKeys(t, testKey, false)
+
+	checkSessionPair(t, newSession(t, iSend, iRecv), newSession(t, rSend, rRecv))
 }
 
 // testKeyB64Bytes returns the key that testKeyB64 encodes: the bytes 0 to 31.
