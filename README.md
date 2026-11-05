@@ -43,7 +43,7 @@ go build -o bin/govpn ./cmd/govpn
 ## Usage
 
 ```
-govpn -peer ip:port -address ip/len -key-file path [-port port]
+govpn -peer ip:port -address ip/len -key-file path [-port port] [-initiator]
 ```
 
 | Flag | Description | Default |
@@ -52,6 +52,7 @@ govpn -peer ip:port -address ip/len -key-file path [-port port]
 | `-address` | Tunnel address of this peer, with prefix length (e.g. `10.0.0.1/24`). Must be an IPv4 host address, not the network address, and not a `/32`. Required. | none |
 | `-key-file` | Path to the key file (see [Key file](#key-file)). Required. | none |
 | `-port` | Local UDP port to listen on (1 to 65535). | `9000` |
+| `-initiator` | Set on exactly one of the two peers (see [Initiator](#initiator)). | off |
 
 ### Key file
 
@@ -82,16 +83,22 @@ If both peers' addresses are in the same subnet (for example `10.0.0.1/24` and `
 ip route add 10.0.1.0/24 dev tun0
 ```
 
+### Initiator
+
+`govpn` does not encrypt with the key file directly. It derives two keys from it with HKDF-SHA256, one for each direction of the tunnel, so the two peers never encrypt with the same key.
+
+`-initiator` decides which key this peer encrypts with. Pass it to exactly one of the two peers. If both peers have it, or neither does, they encrypt with the same key: the tunnel does not work, nothing is logged, and nonces are reused (see [Security](#security)). `govpn` cannot detect this, because neither peer knows how the other was started.
+
 ## Try it locally
 
 ### With Docker
 
 `docker-compose.yml` runs two peers on a private network (`172.30.0.0/24`). The peers' TUN addresses are in different subnets, so each container also adds a route to the other peer's subnet on startup:
 
-| Container | Network address | TUN address |
-|---|---|---|
-| `govpn-a` | `172.30.0.2` | `10.0.0.1/24` |
-| `govpn-b` | `172.30.0.3` | `10.0.1.1/24` |
+| Container | Network address | TUN address | Initiator |
+|---|---|---|---|
+| `govpn-a` | `172.30.0.2` | `10.0.0.1/24` | yes |
+| `govpn-b` | `172.30.0.3` | `10.0.1.1/24` | no |
 
 Both containers read the key from `govpn.key` in the repository root, mounted as a Compose secret at `/run/secrets/govpn_key`. Generate it first (see [Key file](#key-file)), then start both peers:
 
@@ -122,11 +129,11 @@ If the containers keep restarting, check `docker compose logs`. A message saying
 
 `scripts/lab-up.sh` creates two network namespaces, `A` and `B`, connected by a virtual cable (`192.168.50.1` and `192.168.50.2`). Each namespace acts as a separate machine.
 
-Build the binary (see [Build](#build)) and generate a key (see [Key file](#key-file)). Then start the lab and one `govpn` per namespace, each in its own terminal:
+Build the binary (see [Build](#build)) and generate a key (see [Key file](#key-file)). Then start the lab and one `govpn` per namespace, each in its own terminal. `A` is the initiator:
 
 ```
 sudo ./scripts/lab-up.sh
-sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24 -key-file govpn.key
+sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24 -key-file govpn.key -initiator
 sudo ip netns exec B ./bin/govpn -peer 192.168.50.1:9000 -address 10.0.0.2/24 -key-file govpn.key
 ```
 
@@ -151,7 +158,7 @@ sudo ip netns exec A tcpdump -ni vethA -X udp port 9000
 
 Each UDP payload starts with `0400 0000` (the message type), then 4 zero bytes (the receiver index), then the 8-byte counter, which goes up by one with each packet. Everything after that looks random. Without encryption, you would see the inner IPv4 header (starting with `45`) and the `10.0.0.x` addresses instead.
 
-If the two peers use different keys, the ping gets no replies, and neither `govpn` prints anything.
+If the two peers use different keys, or both or neither pass `-initiator`, the ping gets no replies, and neither `govpn` prints anything.
 
 Clean up with `sudo ./scripts/lab-down.sh`.
 
@@ -173,7 +180,7 @@ Clean up with `sudo ./scripts/lab-down.sh`.
 
 Each packet is encrypted and authenticated, so a modified or forged packet is dropped. The scheme still has these known weaknesses:
 
-- **Nonces are reused.** Both peers encrypt with the same key, and each peer's counter starts at 0. So packet *n* from one peer and packet *n* from the other use the same key and nonce. Restarting a peer resets its counter, which reuses nonces too. Reusing a nonce with ChaCha20-Poly1305 lets an observer learn information about the plaintext and forge packets. The fix is a separate key for each direction, which is planned.
+- **Nonces are reused after a restart.** Each direction has its own key, but the keys depend only on the key file. A restarted peer derives the same key, starts its counter at 0 again, and reuses nonces it already sent. The same happens between the two peers if both or neither pass `-initiator`. Reusing a nonce with ChaCha20-Poly1305 lets an observer learn information about the plaintext and forge packets. A key exchange that creates new keys on every start would fix this.
 - **No replay protection.** A captured packet can be sent again and is accepted.
 - **No key exchange.** The key is shared manually and never changes, so there is no forward secrecy: anyone who obtains the key can decrypt all past and future traffic.
 

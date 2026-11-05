@@ -34,16 +34,18 @@ func main() {
 	port := flag.Int("port", 9000, "local UDP `port` to listen on, must be between 1 and 65535")
 	flag.TextVar(&address, "address", netip.Prefix{}, "tunnel address of this peer, as `ip/len` (e.g. 10.0.0.1/24)")
 	keyFile := flag.String("key-file", "", "`path` to the base64 key file, readable only by its owner")
+	isInitiator := flag.Bool("initiator", false, "set on exactly one of the two peers: this peer encrypts with the initiator-to-responder key")
+
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
 		fmt.Fprint(w, `govpn creates a Virtual Private Network so you can safely communicate with
 other peers.
 
 Usage:
-  govpn -peer ip:port -address ip/len -key-file path [-port port]
+  govpn -peer ip:port -address ip/len -key-file path [-port port] [-initiator]
 
 Example (two-namespace lab, see scripts/lab-up.sh):
-  sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24 -key-file govpn.key
+  sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24 -key-file govpn.key -initiator
   sudo ip netns exec B ./bin/govpn -peer 192.168.50.1:9000 -address 10.0.0.2/24 -key-file govpn.key
   sudo ip netns exec A ping 10.0.0.2
 
@@ -74,7 +76,7 @@ Flags:
 		flagErrorf("-port must be between 1 and 65535, got %d", *port)
 	}
 
-	if err := run(*port, peer, address, *keyFile); err != nil {
+	if err := run(*port, peer, address, *keyFile, *isInitiator); err != nil {
 		log.Fatal(err)
 	}
 
@@ -89,7 +91,7 @@ func flagErrorf(format string, args ...any) {
 	os.Exit(2)
 }
 
-func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string) error {
+func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string, isInitiator bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var wg sync.WaitGroup
@@ -99,7 +101,12 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string) error
 		return err
 	}
 
-	s, err := session.New(key, key)
+	sendKey, recvKey, err := session.DeriveKeys(key, isInitiator)
+	if err != nil {
+		return fmt.Errorf("deriving keys from shared secret: %w", err)
+	}
+
+	s, err := session.New(sendKey, recvKey)
 	if err != nil {
 		return fmt.Errorf("creating session: %w", err)
 	}
