@@ -2,6 +2,8 @@ package session
 
 import (
 	"crypto/cipher"
+	"crypto/hkdf"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -13,11 +15,12 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// Session encrypts and decrypts transport data messages with a single key.
-// It is safe for concurrent use.
+// Session seals messages with one key and opens them with another, one for
+// each direction of a tunnel. It is safe for concurrent use.
 type Session struct {
-	aead    cipher.AEAD
-	counter atomic.Uint64
+	sendAEAD    cipher.AEAD
+	recvAEAD    cipher.AEAD
+	sendCounter atomic.Uint64
 }
 
 // Key is a symmetric key for sealing and opening transport data messages.
@@ -49,18 +52,23 @@ var (
 	ErrCounterExhausted = errors.New("session: reached counter limit")
 )
 
-// New returns a Session that seals and opens messages with key.
+// New returns a Session that seals messages with send and opens them with
+// recv. The peer's Session must use the same keys the other way around.
 //
-// Nonces are unique only within one Session. Two Sessions that seal with
-// the same key, such as the two ends of a tunnel, reuse nonces, which breaks
-// ChaCha20-Poly1305. Each direction needs its own key; this is not done yet.
-func New(key Key) (*Session, error) {
-	aead, err := chacha20poly1305.New(key[:])
+// Nonces are unique only within one Session: a new Session with the same
+// send key starts its counter at 0 again and reuses nonces.
+func New(send, recv Key) (*Session, error) {
+	sendAEAD, err := chacha20poly1305.New(send[:])
 	if err != nil {
 		return nil, err
 	}
 
-	session := Session{aead: aead}
+	recvAEAD, err := chacha20poly1305.New(recv[:])
+	if err != nil {
+		return nil, err
+	}
+
+	session := Session{sendAEAD: sendAEAD, recvAEAD: recvAEAD}
 	return &session, nil
 }
 
@@ -78,7 +86,7 @@ func makeNonce(counter uint64) [chacha20poly1305.NonceSize]byte {
 // Each call uses the next counter value as the nonce. Once Seal returns
 // ErrCounterExhausted, the caller must stop sending with this Session.
 func (s *Session) Seal(dst, packet []byte) ([]byte, error) {
-	count := s.counter.Add(1) - 1
+	count := s.sendCounter.Add(1) - 1
 	if count >= counterLimit {
 		return nil, ErrCounterExhausted
 	}
@@ -87,7 +95,7 @@ func (s *Session) Seal(dst, packet []byte) ([]byte, error) {
 	dst = binary.LittleEndian.AppendUint32(dst, messageType)
 	dst = binary.LittleEndian.AppendUint32(dst, receiverIndex)
 	dst = binary.LittleEndian.AppendUint64(dst, count)
-	return s.aead.Seal(dst, nonce[:], packet, nil), nil
+	return s.sendAEAD.Seal(dst, nonce[:], packet, nil), nil
 }
 
 // Open authenticates and decrypts a transport data message, appends the
@@ -110,7 +118,7 @@ func (s *Session) Open(dst, msg []byte) ([]byte, error) {
 
 	nonce := makeNonce(binary.LittleEndian.Uint64(msg[counterOffset:HeaderSize]))
 
-	res, err := s.aead.Open(dst, nonce[:], msg[HeaderSize:], nil)
+	res, err := s.recvAEAD.Open(dst, nonce[:], msg[HeaderSize:], nil)
 	if err != nil {
 		return nil, ErrAuth
 	}
@@ -137,4 +145,46 @@ func ParseKey(s string) (Key, error) {
 	copy(res[:], key)
 
 	return res, nil
+}
+
+// HKDF info labels, one for each direction of the tunnel. They name the
+// protocol, its version, and the direction, so each label gives a different
+// key. Both peers must use the same labels, or they derive different keys.
+const (
+	infoInitiatorToResponder = "govpn v1 initiator to responder"
+	infoResponderToInitiator = "govpn v1 responder to initiator"
+)
+
+// deriveKey derives a key from shared with HKDF-SHA256, using info as the label.
+func deriveKey(shared Key, info string) (Key, error) {
+	key, err := hkdf.Key(sha256.New, shared[:], nil, info, chacha20poly1305.KeySize)
+	if err != nil {
+		return Key{}, fmt.Errorf("hkdf: %w", err)
+	}
+	return Key(key), nil
+}
+
+// DeriveKeys derives one key for each direction of a tunnel from shared, and
+// returns the keys this peer seals and opens with, ready to pass to New.
+// Exactly one of the two peers must set initiator. If both or neither do,
+// both peers seal with the same key and cannot open each other's messages.
+//
+// DeriveKeys is temporary: a handshake will replace it. The keys depend only
+// on shared, so a restarted peer derives the same send key, starts its
+// counter at 0 again, and reuses nonces.
+func DeriveKeys(shared Key, initiator bool) (send, recv Key, err error) {
+	i2r, err := deriveKey(shared, infoInitiatorToResponder)
+	if err != nil {
+		return Key{}, Key{}, fmt.Errorf("session: deriving initiator to responder key: %w", err)
+	}
+
+	r2i, err := deriveKey(shared, infoResponderToInitiator)
+	if err != nil {
+		return Key{}, Key{}, fmt.Errorf("session: deriving responder to initiator key: %w", err)
+	}
+
+	if initiator {
+		return i2r, r2i, nil
+	}
+	return r2i, i2r, nil
 }
