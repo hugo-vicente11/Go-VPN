@@ -16,11 +16,13 @@ import (
 )
 
 // Session seals messages with one key and opens them with another, one for
-// each direction of a tunnel. It is safe for concurrent use.
+// each direction of a tunnel. Open accepts each message at most once. It is
+// safe for concurrent use.
 type Session struct {
-	sendAEAD    cipher.AEAD
-	recvAEAD    cipher.AEAD
-	sendCounter atomic.Uint64
+	sendAEAD     cipher.AEAD
+	recvAEAD     cipher.AEAD
+	sendCounter  atomic.Uint64
+	replayWindow replayWindow
 }
 
 // Key is a symmetric key for sealing and opening transport data messages.
@@ -50,6 +52,9 @@ var (
 	// ErrCounterExhausted means the session has sealed too many messages
 	// and must not be used to send again.
 	ErrCounterExhausted = errors.New("session: reached counter limit")
+	// ErrReplay means the message was already opened, or is too old for the
+	// replay window to tell whether it was.
+	ErrReplay = errors.New("session: replayed or too old message")
 )
 
 // New returns a Session that seals messages with send and opens them with
@@ -101,8 +106,9 @@ func (s *Session) Seal(dst, packet []byte) ([]byte, error) {
 // Open authenticates and decrypts a transport data message, appends the
 // packet to dst, and returns the updated slice. dst may be nil.
 //
-// It returns ErrShort, ErrType, or ErrAuth if msg is invalid. Callers
-// should drop invalid messages without replying.
+// It returns ErrShort, ErrType, or ErrAuth if msg is invalid, and ErrReplay
+// if msg was already opened or is too old to tell. Callers should drop
+// invalid messages without replying.
 func (s *Session) Open(dst, msg []byte) ([]byte, error) {
 	if len(msg) < Overhead {
 		return nil, ErrShort
@@ -116,11 +122,16 @@ func (s *Session) Open(dst, msg []byte) ([]byte, error) {
 		return nil, ErrType
 	}
 
-	nonce := makeNonce(binary.LittleEndian.Uint64(msg[counterOffset:HeaderSize]))
+	counter := binary.LittleEndian.Uint64(msg[counterOffset:HeaderSize])
+	nonce := makeNonce(counter)
 
 	res, err := s.recvAEAD.Open(dst, nonce[:], msg[HeaderSize:], nil)
 	if err != nil {
 		return nil, ErrAuth
+	}
+
+	if s.replayWindow.accept(counter) != nil {
+		return nil, ErrReplay
 	}
 
 	return res, nil

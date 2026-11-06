@@ -15,6 +15,7 @@ app -> tun0 -> govpn -> UDP -> govpn -> tun0 -> app
 - Reads IP packets from a TUN device, encrypts each one, and sends it as a UDP datagram to the peer.
 - Receives datagrams from the peer, decrypts them, and writes the packets back to the TUN device.
 - Datagrams from any address other than the configured peer are dropped. So are datagrams that fail to decrypt, without a reply or a log line.
+- Each message is accepted at most once. Messages may arrive out of order, but one that was already received, or is more than 63 counters older than the newest one, is dropped the same way.
 - Shuts down cleanly on `SIGINT` and `SIGTERM`.
 
 Each packet is encrypted with ChaCha20-Poly1305 and sent in the same format as a WireGuard transport data message:
@@ -178,15 +179,16 @@ Clean up with `sudo ./scripts/lab-down.sh`.
 
 ## Security
 
-Each packet is encrypted and authenticated, so a modified or forged packet is dropped. The scheme still has these known weaknesses:
+Each packet is encrypted and authenticated, so a modified or forged packet is dropped. A captured packet sent again is dropped too. The scheme still has these known weaknesses:
 
 - **Nonces are reused after a restart.** Each direction has its own key, but the keys depend only on the key file. A restarted peer derives the same key, starts its counter at 0 again, and reuses nonces it already sent. The same happens between the two peers if both or neither pass `-initiator`. Reusing a nonce with ChaCha20-Poly1305 lets an observer learn information about the plaintext and forge packets. A key exchange that creates new keys on every start would fix this.
-- **No replay protection.** A captured packet can be sent again and is accepted.
+- **Restarting one peer stalls the tunnel.** The other peer still remembers the counters it received, so it drops everything the restarted peer sends until that peer's counter passes the last one received before the restart. After a long session this can take a very long time. Restart both peers to recover.
 - **No key exchange.** The key is shared manually and never changes, so there is no forward secrecy: anyone who obtains the key can decrypt all past and future traffic.
 
 ## Limitations
 
-- Pre-shared key only: no key exchange, rekeying, or replay protection (see [Security](#security))
+- Pre-shared key only: no key exchange or rekeying (see [Security](#security))
+- Restarting one peer requires restarting the other (see [Security](#security))
 - Point-to-point only (one peer)
 - IPv4 only
 - The TUN MTU assumes the underlying link has a 1500-byte MTU
