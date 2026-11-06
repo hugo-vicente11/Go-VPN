@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -199,6 +201,94 @@ func TestOpenRejectsWrongKey(t *testing.T) {
 
 	if _, err := newTestSession(t, otherKey).Open(nil, msg); !errors.Is(err, ErrAuth) {
 		t.Errorf("Open: error = %v, want %v", err, ErrAuth)
+	}
+}
+
+func TestOpenRejectsReplay(t *testing.T) {
+	s := newTestSession(t, testKey)
+	msg := seal(t, s, []byte("hello"))
+
+	if _, err := s.Open(nil, msg); err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	if _, err := s.Open(nil, msg); !errors.Is(err, ErrReplay) {
+		t.Errorf("second Open: error = %v, want %v", err, ErrReplay)
+	}
+}
+
+// TestOpenAcceptsReordered checks that messages arriving out of order, as UDP
+// allows, are all opened.
+func TestOpenAcceptsReordered(t *testing.T) {
+	s := newTestSession(t, testKey)
+	packets := [][]byte{[]byte("zero"), []byte("one"), []byte("two")}
+
+	var msgs [][]byte
+	for _, p := range packets {
+		msgs = append(msgs, seal(t, s, p))
+	}
+
+	for _, i := range []int{0, 2, 1} {
+		got, err := s.Open(nil, msgs[i])
+		if err != nil {
+			t.Fatalf("Open message %d: %v", i, err)
+		}
+		if !bytes.Equal(got, packets[i]) {
+			t.Errorf("Open message %d = %q, want %q", i, got, packets[i])
+		}
+	}
+}
+
+// TestOpenForgedCounterKeepsWindow checks that a message that fails
+// authentication does not move the replay window. Anyone can send a message
+// with a high counter. If Open moved the window before authenticating it,
+// every real message after it would be rejected as too old.
+func TestOpenForgedCounterKeepsWindow(t *testing.T) {
+	s := newTestSession(t, testKey)
+	real := seal(t, s, []byte("real"))
+
+	forged := seal(t, s, []byte("forged"))
+	binary.LittleEndian.PutUint64(forged[counterOffset:HeaderSize], 1<<40)
+
+	if _, err := s.Open(nil, forged); !errors.Is(err, ErrAuth) {
+		t.Fatalf("Open forged message: error = %v, want %v", err, ErrAuth)
+	}
+	if _, err := s.Open(nil, real); err != nil {
+		t.Errorf("Open real message after a forged one: %v", err)
+	}
+}
+
+// TestOpenConcurrentReplay checks that when many goroutines open the same
+// message at once, exactly one succeeds. Run it with -race.
+func TestOpenConcurrentReplay(t *testing.T) {
+	const goroutines = 100
+
+	s := newTestSession(t, testKey)
+	msg := seal(t, s, []byte("hello"))
+
+	var accepted atomic.Int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := s.Open(nil, msg)
+			switch {
+			case err == nil:
+				accepted.Add(1)
+			case !errors.Is(err, ErrReplay):
+				t.Errorf("Open: error = %v, want nil or %v", err, ErrReplay)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if got := accepted.Load(); got != 1 {
+		t.Errorf("Open succeeded %d times, want 1", got)
 	}
 }
 
