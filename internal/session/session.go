@@ -50,6 +50,9 @@ var (
 	// ErrCounterExhausted means the session has sealed too many messages
 	// and must not be used to send again.
 	ErrCounterExhausted = errors.New("session: reached counter limit")
+	// ErrReplay means the message was already opened, or is too old for the
+	// replay window to tell whether it was.
+	ErrReplay = errors.New("session: replayed or too old message")
 )
 
 // New returns a Session that seals messages with send and opens them with
