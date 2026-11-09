@@ -97,3 +97,21 @@ func (k *PublicKey) String() string {
 func (k *PrivateKey) Encode() string {
 	return base64.StdEncoding.EncodeToString(k.key.Bytes())
 }
+
+// SharedSecret computes the X25519 Diffie-Hellman shared secret between k and
+// peer, as specified in RFC 7748, section 6.1. Both peers get the same secret:
+// a.SharedSecret(b.PublicKey()) equals b.SharedSecret(a.PublicKey()).
+//
+// It returns an error if peer is a low-order point, such as all zeros, which
+// would make the secret all zeros whatever the private key is.
+//
+// The secret is not uniformly random, so it must not be used directly as an
+// encryption key: pass it through a key derivation function such as HKDF.
+func (k *PrivateKey) SharedSecret(peer *PublicKey) ([32]byte, error) {
+	secretBytes, err := k.key.ECDH(peer.key)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("identity: computing shared secret: %w", err)
+	}
+
+	return [32]byte(secretBytes), nil
+}
