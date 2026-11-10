@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"io/fs"
 	"net/netip"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hugo-vicente11/go-vpn/internal/identity"
 	"github.com/hugo-vicente11/go-vpn/internal/session"
 )
 
@@ -118,5 +120,131 @@ func TestLoadKeyMissingIsNotExist(t *testing.T) {
 	_, err := loadKey(filepath.Join(t.TempDir(), "missing.key"))
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("loadKey error = %v, want it to wrap %v", err, fs.ErrNotExist)
+	}
+}
+
+// Alice's key pair from RFC 7748, section 6.1, in base64.
+const (
+	alicePrivate = "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo="
+	alicePublic  = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo="
+)
+
+// errWrite is the error failingWriter returns.
+var errWrite = errors.New("write failed")
+
+// failingWriter is an io.Writer whose writes always fail, like stdout
+// redirected to a full disk.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errWrite }
+
+// runGenkey calls genkey and returns what it wrote, failing the test on error.
+func runGenkey(t *testing.T) string {
+	t.Helper()
+	var out bytes.Buffer
+	if err := genkey(&out); err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	return out.String()
+}
+
+func TestGenkey(t *testing.T) {
+	out := runGenkey(t)
+
+	key, ok := strings.CutSuffix(out, "\n")
+	if !ok {
+		t.Fatalf("genkey wrote %q, want it to end with a newline", out)
+	}
+	if strings.ContainsAny(key, " \t\n") {
+		t.Errorf("genkey wrote %q, want only the key and one newline", out)
+	}
+	if _, err := identity.ParsePrivateKey(key); err != nil {
+		t.Errorf("ParsePrivateKey(genkey output): %v", err)
+	}
+}
+
+func TestGenkeyIsRandom(t *testing.T) {
+	if a, b := runGenkey(t), runGenkey(t); a == b {
+		t.Errorf("genkey wrote %q twice", a)
+	}
+}
+
+func TestPubkey(t *testing.T) {
+	for _, input := range []string{alicePrivate, alicePrivate + "\n"} {
+		var out bytes.Buffer
+		if err := pubkey(strings.NewReader(input), &out); err != nil {
+			t.Fatalf("pubkey(%q): %v", input, err)
+		}
+		if got, want := out.String(), alicePublic+"\n"; got != want {
+			t.Errorf("pubkey(%q) wrote %q, want %q", input, got, want)
+		}
+	}
+}
+
+// TestPubkeyGenkey checks that pubkey reads what genkey writes, as in
+// govpn genkey | govpn pubkey, and gets the same key as identity.
+func TestPubkeyGenkey(t *testing.T) {
+	private := runGenkey(t)
+
+	var out bytes.Buffer
+	if err := pubkey(strings.NewReader(private), &out); err != nil {
+		t.Fatalf("pubkey(genkey output): %v", err)
+	}
+
+	key, err := identity.ParsePrivateKey(private)
+	if err != nil {
+		t.Fatalf("ParsePrivateKey(genkey output): %v", err)
+	}
+	if got, want := out.String(), key.PublicKey().String()+"\n"; got != want {
+		t.Errorf("pubkey wrote %q, want %q", got, want)
+	}
+}
+
+func TestPubkeyRejectsEmptyInput(t *testing.T) {
+	for _, input := range []string{"", "\n", "  \t\n"} {
+		var out bytes.Buffer
+		if err := pubkey(strings.NewReader(input), &out); !errors.Is(err, errNoPrivateKey) {
+			t.Errorf("pubkey(%q) error = %v, want %v", input, err, errNoPrivateKey)
+		}
+		if out.Len() != 0 {
+			t.Errorf("pubkey(%q) wrote %q, want nothing", input, out.String())
+		}
+	}
+}
+
+func TestPubkeyRejectsInvalidKey(t *testing.T) {
+	for _, input := range []string{"not base64!", "AAAA", alicePublic + "AAAA"} {
+		var out bytes.Buffer
+		err := pubkey(strings.NewReader(input), &out)
+		if err == nil {
+			t.Errorf("pubkey(%q) returned nil error, want one", input)
+			continue
+		}
+		if errors.Is(err, errNoPrivateKey) {
+			t.Errorf("pubkey(%q) error = %v, want an invalid key error, not %v", input, err, errNoPrivateKey)
+		}
+		if out.Len() != 0 {
+			t.Errorf("pubkey(%q) wrote %q, want nothing", input, out.String())
+		}
+	}
+}
+
+// TestWriteErrors checks that genkey and pubkey report a failed write, so a
+// user does not end up with an empty key file and no error.
+func TestWriteErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{"genkey", func() error { return genkey(failingWriter{}) }},
+		{"pubkey", func() error { return pubkey(strings.NewReader(alicePrivate), failingWriter{}) }},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); !errors.Is(err, errWrite) {
+				t.Errorf("error = %v, want it to wrap %v", err, errWrite)
+			}
+		})
 	}
 }
