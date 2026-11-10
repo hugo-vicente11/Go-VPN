@@ -45,7 +45,11 @@ go build -o bin/govpn ./cmd/govpn
 
 ```
 govpn -peer ip:port -address ip/len -key-file path [-port port] [-initiator]
+govpn genkey
+govpn pubkey
 ```
+
+The first form runs the tunnel. `genkey` and `pubkey` create key pairs (see [Key pairs](#key-pairs)).
 
 | Flag | Description | Default |
 |---|---|---|
@@ -89,6 +93,25 @@ ip route add 10.0.1.0/24 dev tun0
 `govpn` does not encrypt with the key file directly. It derives two keys from it with HKDF-SHA256, one for each direction of the tunnel, so the two peers never encrypt with the same key.
 
 `-initiator` decides which key this peer encrypts with. Pass it to exactly one of the two peers. If both peers have it, or neither does, they encrypt with the same key: the tunnel does not work, nothing is logged, and nonces are reused (see [Security](#security)). `govpn` cannot detect this, because neither peer knows how the other was started.
+
+### Key pairs
+
+`govpn` can create X25519 key pairs, the kind WireGuard uses to identify each peer. Each peer keeps its private key secret and gives its public key to the other peer.
+
+**The tunnel does not use key pairs yet.** It still encrypts with the key file. Key pairs are the first step towards a key exchange (see [Security](#security)).
+
+Generate a private key, then compute its public key:
+
+```
+(umask 077; govpn genkey > private.key)
+govpn pubkey < private.key > public.key
+```
+
+`genkey` writes a new random private key. `pubkey` reads a private key and writes the matching public key. Both write the key as standard base64 followed by a newline, the same format as `wg genkey` and `wg pubkey`, so keys from either tool work with the other.
+
+`umask 077` creates `private.key` readable only by its owner. Without it, the file usually ends up readable by every user on the machine. Never share or commit the private key. The public key is not secret.
+
+A private key is not a key file, even though both look the same. Keep them in separate files, and do not pass `private.key` to `-key-file`.
 
 ## Try it locally
 
@@ -167,8 +190,9 @@ Clean up with `sudo ./scripts/lab-down.sh`.
 
 | Path | Purpose |
 |---|---|
-| `cmd/govpn` | The VPN executable |
+| `cmd/govpn` | The VPN executable, including the `genkey` and `pubkey` commands |
 | `cmd/udptest` | Standalone tool to test the UDP transport |
+| `internal/identity` | X25519 key pairs: generation, parsing, and Diffie-Hellman |
 | `internal/session` | Encryption and decryption of tunnel messages, and key parsing |
 | `internal/tun` | TUN device wrapper |
 | `internal/transport` | UDP transport |

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,9 +10,11 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 
+	"github.com/hugo-vicente11/go-vpn/internal/identity"
 	"github.com/hugo-vicente11/go-vpn/internal/session"
 	"github.com/hugo-vicente11/go-vpn/internal/transport"
 	"github.com/hugo-vicente11/go-vpn/internal/tun"
@@ -27,6 +30,24 @@ const (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "genkey":
+			checkNoArgs("genkey", "genkey")
+			if err := genkey(os.Stdout); err != nil {
+				log.Fatal(err)
+			}
+			return
+
+		case "pubkey":
+			checkNoArgs("pubkey", "pubkey < private.key")
+			if err := pubkey(os.Stdin, os.Stdout); err != nil {
+				log.Fatal(err)
+			}
+			return
+		}
+	}
+
 	// Parsing command line arguments
 	var peer netip.AddrPort
 	var address netip.Prefix
@@ -43,6 +64,10 @@ other peers.
 
 Usage:
   govpn -peer ip:port -address ip/len -key-file path [-port port] [-initiator]
+  (umask 077; govpn genkey > private.key)
+  govpn pubkey < private.key > public.key
+
+genkey writes a new private key; pubkey reads one and writes its public key.
 
 Example (two-namespace lab, see scripts/lab-up.sh):
   sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24 -key-file govpn.key -initiator
@@ -80,6 +105,19 @@ Flags:
 		log.Fatal(err)
 	}
 
+}
+
+// checkNoArgs exits with status 2 if the command cmd was given any arguments.
+// It prints a short usage line instead of the tunnel's flags, which cmd does
+// not use. Everything goes to stderr, because stdout carries the command's
+// output, such as a key redirected into a file.
+func checkNoArgs(cmd, usage string) {
+	if len(os.Args) <= 2 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "govpn %s: unexpected arguments: %q\n", cmd, os.Args[2:])
+	fmt.Fprintf(os.Stderr, "Usage: govpn %s\n", usage)
+	os.Exit(2)
 }
 
 // flagErrorf reports a command-line usage error, prints usage, and exits with
@@ -249,4 +287,50 @@ func loadKey(path string) (session.Key, error) {
 	}
 
 	return key, nil
+}
+
+// genkey writes a new private key to w, in base64 followed by a newline,
+// the same format as wg genkey.
+func genkey(w io.Writer) error {
+	key, err := identity.GeneratePrivateKey()
+	if err != nil {
+		return err
+	}
+
+	_, err = fmt.Fprintln(w, key.Encode())
+	if err != nil {
+		return fmt.Errorf("writing private key: %w", err)
+	}
+
+	return nil
+}
+
+// errNoPrivateKey means pubkey's input was empty or only whitespace.
+var errNoPrivateKey = errors.New("no private key in input")
+
+// pubkey reads a private key from r and writes its public key to w, in base64
+// followed by a newline, the same format as wg pubkey. It returns
+// errNoPrivateKey if r is empty or holds only whitespace.
+func pubkey(r io.Reader, w io.Writer) error {
+	privKeyBytes, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("reading private key: %w", err)
+	}
+
+	privKeyString := strings.TrimSpace(string(privKeyBytes))
+	if privKeyString == "" {
+		return errNoPrivateKey
+	}
+
+	privKey, err := identity.ParsePrivateKey(privKeyString)
+	if err != nil {
+		return err
+	}
+
+	_, err = fmt.Fprintln(w, privKey.PublicKey())
+	if err != nil {
+		return fmt.Errorf("writing public key: %w", err)
+	}
+
+	return nil
 }
