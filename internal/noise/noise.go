@@ -9,6 +9,21 @@ import (
 	"golang.org/x/crypto/blake2s"
 )
 
+// Protocol names from section 5.4 of the whitepaper. Every WireGuard peer
+// uses the same values, so a typo here breaks every handshake.
+const (
+	construction = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+	identifier   = "WireGuard v1 zx2c4 Jason@zx2c4.com"
+	labelMAC1    = "mac1----"
+)
+
+// initialChainKey and initialHash are Ci and Hi from the whitepaper, the
+// state every handshake starts from.
+var (
+	initialChainKey = hash([]byte(construction))
+	initialHash     = hash(initialChainKey[:], []byte(identifier))
+)
+
 // newBLAKE2s returns an unkeyed BLAKE2s-256 hash, for gohmac.New. It never
 // panics in practice: New256 fails only with a key longer than 32 bytes, and
 // the key here is nil.

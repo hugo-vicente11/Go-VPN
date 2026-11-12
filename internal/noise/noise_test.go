@@ -205,3 +205,18 @@ func TestKDFIsHKDF(t *testing.T) {
 		})
 	}
 }
+
+// TestInitialState checks Ci and Hi against the values wireguard-go hardcodes,
+// also computed with Python.
+func TestInitialState(t *testing.T) {
+	checkHex(t, "initialChainKey", initialChainKey[:], "60e26daef327efc02ec335e2a025d2d016eb4206f87277f52d38d1988b78cd36")
+	checkHex(t, "initialHash", initialHash[:], "2211b361081ac566691243db458ad5322d9c6c662293e8b70ee19c65ba079ef3")
+}
+
+// TestLabelMAC1Length checks that labelMAC1 is 8 bytes, as the whitepaper
+// defines it. A missing dash is easy to miss by eye.
+func TestLabelMAC1Length(t *testing.T) {
+	if len(labelMAC1) != 8 {
+		t.Errorf("len(labelMAC1) = %d, want 8", len(labelMAC1))
+	}
+}
