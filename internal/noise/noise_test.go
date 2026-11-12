@@ -2,6 +2,7 @@ package noise
 
 import (
 	"bytes"
+	"crypto/hkdf"
 	"encoding/hex"
 	"testing"
 
@@ -111,5 +112,96 @@ func TestKeyChangesOutput(t *testing.T) {
 	}
 	if hmac(testKey(), data) == hmac(otherKey, data) {
 		t.Error("hmac gives the same output with two different keys")
+	}
+}
+
+// kdfInputs holds the inputs for the KDF tests, with the outputs Python gives
+// for each one with testKey.
+var kdfInputs = []struct {
+	name       string
+	input      []byte
+	t1, t2, t3 string
+}{
+	{
+		name:  "input",
+		input: []byte("input"),
+		t1:    "87b7f70b24183c6db5dc4f6d9f4c47cdb203321aa2a0bef714896adb3107a040",
+		t2:    "538a02e1eb2e31b7e4d4b82476d1fe2acf50085d3fb584537279195f5d1f5824",
+		t3:    "9ad858025593be88de0f9442a589cfe84a88dc19e4753d93684d1c5efc4837f9",
+	},
+	{
+		// The handshake derives the transport keys from an empty input.
+		name:  "empty",
+		input: nil,
+		t1:    "7a38c34bf2b8738d7374ca77c44ecb309a11d2b2528304fa86052c365e722624",
+		t2:    "1a17621f346abdc520746a9fb64d8eb03231d674fc15687537b0780fd9c060fd",
+		t3:    "4eaf02809ac4b930ef63479de62275f1c55656e61f78a3cc653c18a2223d6c5f",
+	},
+}
+
+func TestKDF3(t *testing.T) {
+	for _, tc := range kdfInputs {
+		t.Run(tc.name, func(t *testing.T) {
+			t1, t2, t3 := kdf3(testKey(), tc.input)
+			checkHex(t, "t1", t1[:], tc.t1)
+			checkHex(t, "t2", t2[:], tc.t2)
+			checkHex(t, "t3", t3[:], tc.t3)
+		})
+	}
+}
+
+// TestKDFOutputsMatch checks that kdf1 and kdf2 return the first outputs of
+// kdf3, as the whitepaper defines them.
+func TestKDFOutputsMatch(t *testing.T) {
+	for _, tc := range kdfInputs {
+		t.Run(tc.name, func(t *testing.T) {
+			t1, t2, _ := kdf3(testKey(), tc.input)
+
+			if got := kdf1(testKey(), tc.input); got != t1 {
+				t.Errorf("kdf1 = %x, want %x", got, t1)
+			}
+			got1, got2 := kdf2(testKey(), tc.input)
+			if got1 != t1 || got2 != t2 {
+				t.Errorf("kdf2 = %x, %x, want %x, %x", got1, got2, t1, t2)
+			}
+		})
+	}
+}
+
+// TestKDFOutputsDiffer checks that the outputs of one call are all different.
+// Equal outputs would mean a missing counter byte or a missing previous output.
+func TestKDFOutputsDiffer(t *testing.T) {
+	for _, tc := range kdfInputs {
+		t.Run(tc.name, func(t *testing.T) {
+			t1, t2, t3 := kdf3(testKey(), tc.input)
+			if t1 == t2 || t2 == t3 || t1 == t3 {
+				t.Errorf("kdf3 outputs are not all different: %x, %x, %x", t1, t2, t3)
+			}
+		})
+	}
+}
+
+// TestKDFIsHKDF checks that kdf3 is HKDF with BLAKE2s, using the standard
+// library's implementation: extract with the key as the salt, then expand to
+// 96 bytes with an empty info.
+func TestKDFIsHKDF(t *testing.T) {
+	for _, tc := range kdfInputs {
+		t.Run(tc.name, func(t *testing.T) {
+			key := testKey()
+			prk, err := hkdf.Extract(newBLAKE2s, tc.input, key[:])
+			if err != nil {
+				t.Fatalf("hkdf.Extract: %v", err)
+			}
+			want, err := hkdf.Expand(newBLAKE2s, prk, "", 96)
+			if err != nil {
+				t.Fatalf("hkdf.Expand: %v", err)
+			}
+
+			t1, t2, t3 := kdf3(key, tc.input)
+			got := bytes.Join([][]byte{t1[:], t2[:], t3[:]}, nil)
+			if !bytes.Equal(got, want) {
+				t.Errorf("kdf3 =\n%x\nwant HKDF\n%x", got, want)
+			}
+		})
 	}
 }
