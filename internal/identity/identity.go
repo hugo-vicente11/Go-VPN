@@ -90,6 +90,13 @@ func (k *PublicKey) String() string {
 	return base64.StdEncoding.EncodeToString(k.key.Bytes())
 }
 
+// Bytes returns the 32 raw bytes of k, as RFC 7748 encodes them, not base64.
+// The handshake mixes these bytes into its hash. Each call returns a new
+// copy, so changing it does not change k.
+func (k *PublicKey) Bytes() []byte {
+	return k.key.Bytes()
+}
+
 // Encode returns k in standard base64 with padding.
 //
 // PrivateKey has no String method on purpose, so that printing or logging a

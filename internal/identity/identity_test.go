@@ -117,6 +117,32 @@ func TestPublicKeyRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPublicKeyBytes checks that Bytes returns the raw key from RFC 7748, and
+// that it is the same key String encodes in base64.
+func TestPublicKeyBytes(t *testing.T) {
+	k := publicKeyFromHex(t, rfc7748.alicePublic)
+
+	if got := hex.EncodeToString(k.Bytes()); got != rfc7748.alicePublic {
+		t.Errorf("Bytes = %s, want %s", got, rfc7748.alicePublic)
+	}
+	if got := base64.StdEncoding.EncodeToString(k.Bytes()); got != k.String() {
+		t.Errorf("Bytes in base64 = %s, want String() = %s", got, k.String())
+	}
+}
+
+// TestPublicKeyBytesIsCopy checks that changing the slice Bytes returns does
+// not change the key.
+func TestPublicKeyBytesIsCopy(t *testing.T) {
+	k := publicKeyFromHex(t, rfc7748.alicePublic)
+
+	b := k.Bytes()
+	b[0] ^= 0xff
+
+	if got := hex.EncodeToString(k.Bytes()); got != rfc7748.alicePublic {
+		t.Errorf("after changing the returned slice, Bytes = %s, want %s", got, rfc7748.alicePublic)
+	}
+}
+
 // parsers runs a test against both Parse functions, which accept the same
 // format.
 var parsers = []struct {
