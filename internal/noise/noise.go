@@ -4,10 +4,12 @@ package noise
 
 import (
 	gohmac "crypto/hmac"
+	"errors"
 	gohash "hash"
 
 	"github.com/hugo-vicente11/go-vpn/internal/identity"
 	"golang.org/x/crypto/blake2s"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // Protocol names from section 5.4 of the whitepaper. Every WireGuard peer
@@ -24,6 +26,11 @@ var (
 	initialChainKey = hash([]byte(construction))
 	initialHash     = hash(initialChainKey[:], []byte(identifier))
 )
+
+// errDecrypt means an encrypted handshake field failed authentication: the
+// key, the associated data or the ciphertext is not what the sender used. It
+// does not say which, because the AEAD cannot tell them apart.
+var errDecrypt = errors.New("noise: decryption failed")
 
 // newBLAKE2s returns an unkeyed BLAKE2s-256 hash, for gohmac.New. It never
 // panics in practice: New256 fails only with a key longer than 32 bytes, and
@@ -118,4 +125,46 @@ func kdf3(key [32]byte, input []byte) ([32]byte, [32]byte, [32]byte) {
 	t3 := hmac(t0, t2[:], []byte{0x3})
 
 	return t1, t2, t3
+}
+
+// aeadEncrypt returns AEAD(key, 0, plaintext, associatedData) from the
+// whitepaper: ChaCha20-Poly1305 with a counter of 0, so the nonce is 12 zero
+// bytes. The result is the ciphertext followed by a 16-byte tag, so it is 16
+// bytes longer than plaintext; an empty plaintext gives just the tag.
+//
+// The handshake uses it to encrypt the initiator's static key, the timestamp
+// and the empty field of the response, with the hash H as associatedData.
+//
+// A fixed nonce is safe only because each key encrypts a single field: the
+// handshake derives a new key with a KDF before every call. Never call it
+// twice with the same key.
+func aeadEncrypt(key [32]byte, plaintext, associatedData []byte) []byte {
+	aead, err := chacha20poly1305.New(key[:])
+	if err != nil {
+		// New fails only with a key that is not 32 bytes long.
+		panic(err)
+	}
+
+	var nonce [chacha20poly1305.NonceSize]byte
+	return aead.Seal(nil, nonce[:], plaintext, associatedData)
+}
+
+// aeadDecrypt reverses aeadEncrypt: it checks the tag and returns the
+// plaintext. It returns errDecrypt if key or associatedData is not the one the
+// sender used, or if ciphertext was changed or is shorter than a tag.
+func aeadDecrypt(key [32]byte, ciphertext, associatedData []byte) ([]byte, error) {
+	aead, err := chacha20poly1305.New(key[:])
+	if err != nil {
+		// New fails only with a key that is not 32 bytes long.
+		panic(err)
+	}
+
+	var nonce [chacha20poly1305.NonceSize]byte
+
+	msg, err := aead.Open(nil, nonce[:], ciphertext, associatedData)
+	if err != nil {
+		return nil, errDecrypt
+	}
+
+	return msg, nil
 }

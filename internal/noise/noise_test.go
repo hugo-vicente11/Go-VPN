@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hkdf"
 	"encoding/hex"
+	"errors"
 	"testing"
 
 	"github.com/hugo-vicente11/go-vpn/internal/identity"
@@ -233,5 +234,104 @@ func TestInitialState(t *testing.T) {
 func TestLabelMAC1Length(t *testing.T) {
 	if len(labelMAC1) != 8 {
 		t.Errorf("len(labelMAC1) = %d, want 8", len(labelMAC1))
+	}
+}
+
+// The expected values in the AEAD tests were computed with a pure Python
+// implementation of ChaCha20-Poly1305, checked first against the test vector
+// in RFC 8439, section 2.8.2.
+
+// TestAEADEncrypt checks aeadEncrypt against known answers, with a zero nonce.
+func TestAEADEncrypt(t *testing.T) {
+	tests := []struct {
+		name      string
+		plaintext string
+		want      string
+	}{
+		{"hello", "hello", "70dd2e5dc2a01c47ad11cc8fb4da686f7449ce51cd"},
+		// The response encrypts an empty field: the result is only the tag.
+		{"empty", "", "c0319e7fe5d5b3e392a884f961f7fd8e"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := aeadEncrypt(testKey(), []byte(tc.plaintext), []byte("ad"))
+			checkHex(t, "aeadEncrypt", got, tc.want)
+		})
+	}
+}
+
+func TestAEADRoundTrip(t *testing.T) {
+	tests := []struct {
+		name           string
+		plaintext      []byte
+		associatedData []byte
+	}{
+		{"with associated data", []byte("hello"), []byte("ad")},
+		{"empty plaintext", nil, []byte("ad")},
+		{"no associated data", []byte("hello"), nil},
+		{"32-byte key as plaintext", make([]byte, 32), make([]byte, 32)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ciphertext := aeadEncrypt(testKey(), tc.plaintext, tc.associatedData)
+			if want := len(tc.plaintext) + 16; len(ciphertext) != want {
+				t.Errorf("len(ciphertext) = %d, want %d", len(ciphertext), want)
+			}
+
+			got, err := aeadDecrypt(testKey(), ciphertext, tc.associatedData)
+			if err != nil {
+				t.Fatalf("aeadDecrypt: %v", err)
+			}
+			if !bytes.Equal(got, tc.plaintext) {
+				t.Errorf("aeadDecrypt = %x, want %x", got, tc.plaintext)
+			}
+		})
+	}
+}
+
+// TestAEADDecryptRejects checks that aeadDecrypt returns errDecrypt when
+// anything differs from what the sender used.
+func TestAEADDecryptRejects(t *testing.T) {
+	plaintext, associatedData := []byte("hello"), []byte("ad")
+	ciphertext := aeadEncrypt(testKey(), plaintext, associatedData)
+
+	// flipped returns a copy of ciphertext with one bit of byte i flipped.
+	flipped := func(i int) []byte {
+		c := bytes.Clone(ciphertext)
+		c[i] ^= 0x01
+		return c
+	}
+
+	otherKey := testKey()
+	otherKey[0] ^= 0x01
+
+	tests := []struct {
+		name           string
+		key            [32]byte
+		ciphertext     []byte
+		associatedData []byte
+	}{
+		{"flipped ciphertext bit", testKey(), flipped(0), associatedData},
+		{"flipped tag bit", testKey(), flipped(len(ciphertext) - 1), associatedData},
+		{"other associated data", testKey(), ciphertext, []byte("ae")},
+		{"missing associated data", testKey(), ciphertext, nil},
+		{"other key", otherKey, ciphertext, associatedData},
+		{"truncated", testKey(), ciphertext[:len(ciphertext)-1], associatedData},
+		{"shorter than a tag", testKey(), ciphertext[:15], associatedData},
+		{"empty", testKey(), nil, associatedData},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := aeadDecrypt(tc.key, tc.ciphertext, tc.associatedData)
+			if !errors.Is(err, errDecrypt) {
+				t.Errorf("aeadDecrypt error = %v, want errDecrypt", err)
+			}
+			if got != nil {
+				t.Errorf("aeadDecrypt = %x, want nil", got)
+			}
+		})
 	}
 }
