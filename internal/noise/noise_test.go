@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"testing"
 
+	"github.com/hugo-vicente11/go-vpn/internal/identity"
 	"golang.org/x/crypto/blake2s"
 )
 
@@ -67,6 +68,20 @@ func TestMAC(t *testing.T) {
 			checkHex(t, "mac", got[:], want)
 		})
 	}
+}
+
+// TestMAC1Key checks mac1Key with Alice's public key from RFC 7748, section
+// 6.1 (8520f009...9b4e6a in hex).
+func TestMAC1Key(t *testing.T) {
+	const alicePublic = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo="
+
+	k, err := identity.ParsePublicKey(alicePublic)
+	if err != nil {
+		t.Fatalf("ParsePublicKey: %v", err)
+	}
+
+	got := mac1Key(k)
+	checkHex(t, "mac1Key", got[:], "0ec72453412f9befa2f799ea837d0b88429321711dd01f9025163123bd1905be")
 }
 
 func TestHMAC(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	gohmac "crypto/hmac"
 	gohash "hash"
 
+	"github.com/hugo-vicente11/go-vpn/internal/identity"
 	"golang.org/x/crypto/blake2s"
 )
 
@@ -65,6 +66,17 @@ func mac(key [32]byte, data ...[]byte) [16]byte {
 		panic(err)
 	}
 	return [16]byte(sum(h, data))
+}
+
+// mac1Key returns the key for the mac1 field of a handshake message:
+// HASH(labelMAC1 || Spub), where Spub is the static public key of the peer
+// that receives the message. The sender uses the peer's key, and the receiver
+// its own.
+//
+// The result depends only on the public key, so each peer can compute it once
+// per key and reuse it for every message.
+func mac1Key(k *identity.PublicKey) [32]byte {
+	return hash([]byte(labelMAC1), k.Bytes())
 }
 
 // hmac returns HMAC(key, data) from the whitepaper: HMAC with BLAKE2s and a
