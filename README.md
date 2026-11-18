@@ -193,6 +193,7 @@ Clean up with `sudo ./scripts/lab-down.sh`.
 | `cmd/govpn` | The VPN executable, including the `genkey` and `pubkey` commands |
 | `cmd/udptest` | Standalone tool to test the UDP transport |
 | `internal/identity` | X25519 key pairs: generation, parsing, and Diffie-Hellman |
+| `internal/noise` | Building blocks of the WireGuard handshake: BLAKE2s hashing, key derivation, handshake field encryption, and TAI64N timestamps. Not used by the tunnel yet |
 | `internal/session` | Encryption and decryption of tunnel messages, and key parsing |
 | `internal/tun` | TUN device wrapper |
 | `internal/transport` | UDP transport |
