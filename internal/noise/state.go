@@ -37,3 +37,31 @@ func newHandshakeState(responderStatic *identity.PublicKey) *handshakeState {
 func (s *handshakeState) mixHash(data []byte) {
 	s.hash = hash(s.hash[:], data)
 }
+
+// mixKey mixes input into the chaining key: C = KDF1(C, input). It does not
+// change the hash. The handshake uses it when nothing is encrypted right
+// after: for each ephemeral public key and the responder's two DH results.
+func (s *handshakeState) mixKey(input []byte) {
+	s.chainKey = kdf1(s.chainKey, input)
+}
+
+// mixKeyAndGetKey mixes input into the chaining key and returns a key for the
+// next encrypted field: C, k = KDF2(C, input). It does not change the hash.
+// The initiator uses it for its two DH results, before it encrypts its static
+// key and the timestamp.
+func (s *handshakeState) mixKeyAndGetKey(input []byte) [32]byte {
+	c, k := kdf2(s.chainKey, input)
+	s.chainKey = c
+	return k
+}
+
+// mixKeyAndHash mixes input into both the chaining key and the hash, and
+// returns a key for the next encrypted field: C, t, k = KDF3(C, input), then
+// H = HASH(H || t). The responder uses it once, for the preshared key.
+func (s *handshakeState) mixKeyAndHash(input []byte) [32]byte {
+	c, t, k := kdf3(s.chainKey, input)
+	s.chainKey = c
+	s.mixHash(t[:])
+
+	return k
+}
