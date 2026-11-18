@@ -132,7 +132,6 @@ func flagErrorf(format string, args ...any) {
 func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string, isInitiator bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	var wg sync.WaitGroup
 
 	key, err := loadKey(keyFile)
 	if err != nil {
@@ -168,70 +167,7 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string, isIni
 	}
 	defer t.Close()
 
-	go func() {
-		<-ctx.Done()
-		dev.Close()
-		t.Close()
-	}()
-
-	recvBuf := make([]byte, udpPayloadSize)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			nRecv, err := t.Recv(recvBuf)
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				fmt.Fprintf(os.Stderr, "Error while reading UDP payload: %v\n", err)
-				continue
-			}
-			packet, err := s.Open(recvBuf[session.HeaderSize:session.HeaderSize], recvBuf[:nRecv])
-			if err != nil {
-				// Drop invalid messages silently. Anyone can send datagrams to
-				// this port, so logging each one would let them flood the logs.
-				continue
-			}
-
-			if len(packet) == 0 {
-				// An empty packet is a keepalive: it only shows the peer is alive,
-				// so there is nothing to write to the TUN device.
-				continue
-			}
-			nWrite, err := dev.Write(packet)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error while writing into %s: %v\n", dev.Name(), err)
-				continue
-			}
-			if len(packet) != nWrite {
-				fmt.Fprintf(os.Stderr, "Did not write everything! wrote: %d expected %d\n", nWrite, len(packet))
-			}
-		}
-	}()
-
-	readBuf := make([]byte, udpPayloadSize)
-	for {
-		nRead, err := dev.Read(readBuf[session.HeaderSize:])
-		if err != nil {
-			if ctx.Err() != nil {
-				wg.Wait()
-				return nil
-			}
-			fmt.Fprintf(os.Stderr, "Error while reading from %s: %v\n", dev.Name(), err)
-			continue
-		}
-		msg, err := s.Seal(readBuf[:0], readBuf[session.HeaderSize:session.HeaderSize+nRead])
-		if err != nil {
-			stop()
-			wg.Wait()
-			return fmt.Errorf("sealing packet: %w", err)
-		}
-		err = t.Send(msg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while sending UDP payload: %v\n", err)
-		}
-	}
+	return forward(ctx, dev, t, s)
 }
 
 // validateTunnelAddr reports an error if p cannot be used as this peer's tunnel address.
@@ -333,4 +269,98 @@ func pubkey(r io.Reader, w io.Writer) error {
 	}
 
 	return nil
+}
+
+// device is what forward needs from the TUN device. *tun.Device satisfies
+// it, and the tests use a fake.
+type device interface {
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+	Name() string
+	Close() error
+}
+
+// conn is what forward needs from the UDP transport. *transport.Transport
+// satisfies it, and the tests use a fake.
+type conn interface {
+	Send(payload []byte) error
+	Recv(buf []byte) (int, error)
+	Close() error
+}
+
+// forward moves packets in both directions until ctx is cancelled: it reads
+// packets from dev, seals them with s and sends them on c, and it receives
+// messages from c, opens them with s and writes the packets to dev. It closes
+// dev and c before it returns.
+//
+// It returns nil when ctx is cancelled, and an error if s can no longer seal,
+// because its send counter is exhausted.
+func forward(ctx context.Context, dev device, c conn, s *session.Session) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	go func() {
+		<-ctx.Done()
+		dev.Close()
+		c.Close()
+	}()
+
+	recvBuf := make([]byte, udpPayloadSize)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			nRecv, err := c.Recv(recvBuf)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				fmt.Fprintf(os.Stderr, "Error while reading UDP payload: %v\n", err)
+				continue
+			}
+			packet, err := s.Open(recvBuf[session.HeaderSize:session.HeaderSize], recvBuf[:nRecv])
+			if err != nil {
+				// Drop invalid messages silently. Anyone can send datagrams to
+				// this port, so logging each one would let them flood the logs.
+				continue
+			}
+
+			if len(packet) == 0 {
+				// An empty packet is a keepalive: it only shows the peer is alive,
+				// so there is nothing to write to the TUN device.
+				continue
+			}
+			nWrite, err := dev.Write(packet)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error while writing into %s: %v\n", dev.Name(), err)
+				continue
+			}
+			if len(packet) != nWrite {
+				fmt.Fprintf(os.Stderr, "Did not write everything! wrote: %d expected %d\n", nWrite, len(packet))
+			}
+		}
+	}()
+
+	readBuf := make([]byte, udpPayloadSize)
+	for {
+		nRead, err := dev.Read(readBuf[session.HeaderSize:])
+		if err != nil {
+			if ctx.Err() != nil {
+				wg.Wait()
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "Error while reading from %s: %v\n", dev.Name(), err)
+			continue
+		}
+		msg, err := s.Seal(readBuf[:0], readBuf[session.HeaderSize:session.HeaderSize+nRead])
+		if err != nil {
+			cancel()
+			wg.Wait()
+			return fmt.Errorf("sealing packet: %w", err)
+		}
+		err = c.Send(msg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while sending UDP payload: %v\n", err)
+		}
+	}
 }
