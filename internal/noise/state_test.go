@@ -1,6 +1,10 @@
 package noise
 
-import "testing"
+import (
+	"bytes"
+	"errors"
+	"testing"
+)
 
 // The expected values in these tests were computed with Python's hashlib,
 // starting from Hi in TestInitialState and Alice's public key.
@@ -131,5 +135,88 @@ func TestHandshakeStatesAgree(t *testing.T) {
 	}
 	if keysA != keysB {
 		t.Error("the two states returned different keys")
+	}
+}
+
+// handshakeStatePair returns two equal states, one for each side of a
+// handshake, and a key for the next encrypted field.
+func handshakeStatePair(t *testing.T) (sender, receiver *handshakeState, key [32]byte) {
+	t.Helper()
+	sender = newHandshakeState(alicePublicKey(t))
+	receiver = newHandshakeState(alicePublicKey(t))
+	return sender, receiver, testKey()
+}
+
+func TestEncryptAndHashRoundTrip(t *testing.T) {
+	for _, plaintext := range [][]byte{[]byte("static key"), nil} {
+		sender, receiver, key := handshakeStatePair(t)
+
+		ciphertext := sender.encryptAndHash(key, plaintext)
+		if want := len(plaintext) + 16; len(ciphertext) != want {
+			t.Errorf("len(ciphertext) = %d, want %d", len(ciphertext), want)
+		}
+
+		got, err := receiver.decryptAndHash(key, ciphertext)
+		if err != nil {
+			t.Fatalf("decryptAndHash(%q): %v", plaintext, err)
+		}
+		if !bytes.Equal(got, plaintext) {
+			t.Errorf("decryptAndHash = %q, want %q", got, plaintext)
+		}
+		if *sender != *receiver {
+			t.Errorf("states differ after %q: hash %x and %x", plaintext, sender.hash, receiver.hash)
+		}
+	}
+}
+
+// TestEncryptAndHashMixesCiphertext checks that the hash takes in the
+// ciphertext, as the whitepaper defines, and that the chaining key is
+// unchanged.
+func TestEncryptAndHashMixesCiphertext(t *testing.T) {
+	s, _, key := handshakeStatePair(t)
+	before := *s
+	plaintext := []byte("static key")
+
+	ciphertext := s.encryptAndHash(key, plaintext)
+
+	if want := aeadEncrypt(key, plaintext, before.hash[:]); !bytes.Equal(ciphertext, want) {
+		t.Errorf("ciphertext = %x, want AEAD with the old hash %x", ciphertext, want)
+	}
+	if want := hash(before.hash[:], ciphertext); s.hash != want {
+		t.Errorf("hash = %x, want HASH(H || ciphertext) %x", s.hash, want)
+	}
+	if s.chainKey != before.chainKey {
+		t.Errorf("encryptAndHash changed chainKey to %x", s.chainKey)
+	}
+}
+
+// TestDecryptAndHashRejects checks that decryption fails when the receiver's
+// state or key differs from the sender's, or the ciphertext was changed, and
+// that a failure leaves the state unchanged.
+func TestDecryptAndHashRejects(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(receiver *handshakeState, key *[32]byte, ciphertext []byte)
+	}{
+		{"different hash", func(r *handshakeState, _ *[32]byte, _ []byte) { r.mixHash([]byte("x")) }},
+		{"different key", func(_ *handshakeState, k *[32]byte, _ []byte) { k[0] ^= 1 }},
+		{"tampered ciphertext", func(_ *handshakeState, _ *[32]byte, c []byte) { c[0] ^= 1 }},
+		{"tampered tag", func(_ *handshakeState, _ *[32]byte, c []byte) { c[len(c)-1] ^= 1 }},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sender, receiver, key := handshakeStatePair(t)
+			ciphertext := sender.encryptAndHash(key, []byte("static key"))
+			tc.setup(receiver, &key, ciphertext)
+			before := *receiver
+
+			if _, err := receiver.decryptAndHash(key, ciphertext); !errors.Is(err, errDecrypt) {
+				t.Fatalf("decryptAndHash error = %v, want %v", err, errDecrypt)
+			}
+			if *receiver != before {
+				t.Error("a failed decryptAndHash changed the state")
+			}
+		})
 	}
 }

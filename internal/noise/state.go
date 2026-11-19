@@ -65,3 +65,31 @@ func (s *handshakeState) mixKeyAndHash(input []byte) [32]byte {
 
 	return k
 }
+
+// encryptAndHash encrypts plaintext with key, using the hash as associated
+// data, then mixes the ciphertext (not the plaintext) into the hash and
+// returns it. The handshake uses it for the initiator's static key, the
+// timestamp and the empty field of the response.
+//
+// The nonce is always zero, so each key must encrypt only one field.
+func (s *handshakeState) encryptAndHash(key [32]byte, plaintext []byte) []byte {
+	ciphertext := aeadEncrypt(key, plaintext, s.hash[:])
+	s.mixHash(ciphertext)
+
+	return ciphertext
+}
+
+// decryptAndHash reverses encryptAndHash: it decrypts ciphertext with key,
+// using the hash as associated data, then mixes the ciphertext into the hash.
+// It returns errDecrypt if decryption fails, and then leaves the state
+// unchanged.
+func (s *handshakeState) decryptAndHash(key [32]byte, ciphertext []byte) ([]byte, error) {
+	plaintext, err := aeadDecrypt(key, ciphertext, s.hash[:])
+	if err != nil {
+		return nil, err
+	}
+
+	s.mixHash(ciphertext)
+
+	return plaintext, nil
+}
