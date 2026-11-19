@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io/fs"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/hugo-vicente11/go-vpn/internal/identity"
 	"github.com/hugo-vicente11/go-vpn/internal/session"
@@ -246,5 +249,246 @@ func TestWriteErrors(t *testing.T) {
 				t.Errorf("error = %v, want it to wrap %v", err, errWrite)
 			}
 		})
+	}
+}
+
+// testTimeout bounds every wait in the forward tests, so a bug makes a test
+// fail instead of hang.
+const testTimeout = 2 * time.Second
+
+// errClosed is what fakePipe returns once it is closed.
+var errClosed = errors.New("fake pipe closed")
+
+// fakePipe stands in for both the TUN device and the UDP transport in the
+// forward tests. The test puts packets on in, which Read and Recv return, and
+// takes what forward writes or sends from out.
+//
+// Like the real device and socket, Close makes a waiting Read or Recv return
+// an error. Without that, forward could never stop.
+type fakePipe struct {
+	in        chan []byte
+	out       chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newFakePipe() *fakePipe {
+	return &fakePipe{
+		in:   make(chan []byte),
+		out:  make(chan []byte, 16),
+		done: make(chan struct{}),
+	}
+}
+
+func (p *fakePipe) Read(b []byte) (int, error) {
+	select {
+	case packet := <-p.in:
+		return copy(b, packet), nil
+	case <-p.done:
+		return 0, errClosed
+	}
+}
+
+// Write stores a copy, because forward reuses its buffers.
+func (p *fakePipe) Write(b []byte) (int, error) {
+	select {
+	case p.out <- bytes.Clone(b):
+		return len(b), nil
+	case <-p.done:
+		return 0, errClosed
+	}
+}
+
+func (p *fakePipe) Recv(b []byte) (int, error) { return p.Read(b) }
+
+func (p *fakePipe) Send(b []byte) error {
+	_, err := p.Write(b)
+	return err
+}
+
+func (p *fakePipe) Name() string { return "fake0" }
+
+func (p *fakePipe) Close() error {
+	p.closeOnce.Do(func() { close(p.done) })
+	return nil
+}
+
+func (p *fakePipe) closed() bool {
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// put gives packet to forward through p, failing the test if forward does not
+// take it in time.
+func (p *fakePipe) put(t *testing.T, packet []byte) {
+	t.Helper()
+	select {
+	case p.in <- packet:
+	case <-time.After(testTimeout):
+		t.Fatalf("forward did not read %q in time", packet)
+	}
+}
+
+// take returns the next packet forward wrote or sent through p, failing the
+// test if none arrives in time.
+func (p *fakePipe) take(t *testing.T) []byte {
+	t.Helper()
+	select {
+	case packet := <-p.out:
+		return packet
+	case <-time.After(testTimeout):
+		t.Fatal("forward did not write anything in time")
+		return nil
+	}
+}
+
+// forwardTest runs forward with fakes, and holds the peer's Session, which
+// uses the same keys the other way around.
+type forwardTest struct {
+	dev, conn *fakePipe
+	peer      *session.Session
+	cancel    context.CancelFunc
+	result    chan error
+}
+
+// startForward starts forward in the background. When the test ends, it
+// stops forward and fails the test if forward does not return.
+func startForward(t *testing.T) *forwardTest {
+	t.Helper()
+	a, b := session.Key{1}, session.Key{2}
+	s, err := session.New(a, b)
+	if err != nil {
+		t.Fatalf("session.New: %v", err)
+	}
+	peer, err := session.New(b, a)
+	if err != nil {
+		t.Fatalf("session.New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ft := &forwardTest{
+		dev:    newFakePipe(),
+		conn:   newFakePipe(),
+		peer:   peer,
+		cancel: cancel,
+		result: make(chan error, 1),
+	}
+	go func() { ft.result <- forward(ctx, ft.dev, ft.conn, s) }()
+
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-ft.result:
+		case <-time.After(testTimeout):
+			t.Error("forward did not return after its context was cancelled")
+		}
+	})
+	return ft
+}
+
+// sealFromPeer returns packet sealed by the peer, ready to put on ft.conn.
+func (ft *forwardTest) sealFromPeer(t *testing.T, packet []byte) []byte {
+	t.Helper()
+	msg, err := ft.peer.Seal(nil, packet)
+	if err != nil {
+		t.Fatalf("peer Seal: %v", err)
+	}
+	return msg
+}
+
+// checkPacket fails the test if got is not want.
+func checkPacket(t *testing.T, got, want []byte) {
+	t.Helper()
+	if !bytes.Equal(got, want) {
+		t.Errorf("device got %q, want %q", got, want)
+	}
+}
+
+func TestForwardSendsPackets(t *testing.T) {
+	ft := startForward(t)
+	packet := []byte("packet from the tun device")
+
+	ft.dev.put(t, packet)
+	msg := ft.conn.take(t)
+
+	got, err := ft.peer.Open(nil, msg)
+	if err != nil {
+		t.Fatalf("peer cannot open the sent message: %v", err)
+	}
+	checkPacket(t, got, packet)
+}
+
+func TestForwardReceivesPackets(t *testing.T) {
+	ft := startForward(t)
+	packet := []byte("packet from the peer")
+
+	ft.conn.put(t, ft.sealFromPeer(t, packet))
+	checkPacket(t, ft.dev.take(t), packet)
+}
+
+// The next tests send a valid message after the one that must be dropped.
+// forward handles messages in order, so if the first thing written to the
+// device is the valid packet, the earlier message was dropped.
+
+func TestForwardDropsInvalidMessages(t *testing.T) {
+	ft := startForward(t)
+	valid := ft.sealFromPeer(t, []byte("valid"))
+	tampered := bytes.Clone(valid)
+	tampered[len(tampered)-1] ^= 1
+
+	for _, msg := range [][]byte{[]byte("garbage"), {}, tampered} {
+		ft.conn.put(t, msg)
+	}
+	ft.conn.put(t, valid)
+
+	checkPacket(t, ft.dev.take(t), []byte("valid"))
+}
+
+func TestForwardDropsReplayedMessages(t *testing.T) {
+	ft := startForward(t)
+	first := ft.sealFromPeer(t, []byte("first"))
+	second := ft.sealFromPeer(t, []byte("second"))
+
+	ft.conn.put(t, first)
+	ft.conn.put(t, first)
+	ft.conn.put(t, second)
+
+	checkPacket(t, ft.dev.take(t), []byte("first"))
+	checkPacket(t, ft.dev.take(t), []byte("second"))
+}
+
+func TestForwardSkipsKeepalives(t *testing.T) {
+	ft := startForward(t)
+
+	ft.conn.put(t, ft.sealFromPeer(t, nil))
+	ft.conn.put(t, ft.sealFromPeer(t, []byte("after keepalive")))
+
+	checkPacket(t, ft.dev.take(t), []byte("after keepalive"))
+}
+
+func TestForwardStopsOnCancel(t *testing.T) {
+	ft := startForward(t)
+	ft.cancel()
+
+	select {
+	case err := <-ft.result:
+		if err != nil {
+			t.Errorf("forward = %v, want nil", err)
+		}
+		// Put the result back for the cleanup in startForward.
+		ft.result <- err
+	case <-time.After(testTimeout):
+		t.Fatal("forward did not return after its context was cancelled")
+	}
+
+	if !ft.dev.closed() {
+		t.Error("forward did not close the device")
+	}
+	if !ft.conn.closed() {
+		t.Error("forward did not close the conn")
 	}
 }
