@@ -1,6 +1,9 @@
 package noise
 
-import "github.com/hugo-vicente11/go-vpn/internal/identity"
+import (
+	"github.com/hugo-vicente11/go-vpn/internal/identity"
+	"github.com/hugo-vicente11/go-vpn/internal/session"
+)
 
 // handshakeState is the state each peer keeps during a handshake: the
 // chaining key C and the hash H from the whitepaper.
@@ -92,4 +95,20 @@ func (s *handshakeState) decryptAndHash(key [32]byte, ciphertext []byte) ([]byte
 	s.mixHash(ciphertext)
 
 	return plaintext, nil
+}
+
+// deriveTransportKeys returns the two transport data keys, the last step of
+// the handshake: T1, T2 = KDF2(C, empty). initiatorToResponder is T1 and
+// responderToInitiator is T2, so the initiator sends with the first and the
+// responder with the second.
+//
+// It then sets the chaining key and the hash to zero, as section 5.4.5 of the
+// whitepaper requires, so that C cannot later reveal the keys. The state must
+// not be used again after this call.
+func (s *handshakeState) deriveTransportKeys() (initiatorToResponder, responderToInitiator session.Key) {
+	initiatorToResponder, responderToInitiator = kdf2(s.chainKey, nil)
+	s.chainKey = [32]byte{}
+	s.hash = [32]byte{}
+
+	return initiatorToResponder, responderToInitiator
 }

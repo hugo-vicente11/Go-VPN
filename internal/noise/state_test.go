@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"github.com/hugo-vicente11/go-vpn/internal/session"
 )
 
 // The expected values in these tests were computed with Python's hashlib,
@@ -218,5 +220,67 @@ func TestDecryptAndHashRejects(t *testing.T) {
 				t.Error("a failed decryptAndHash changed the state")
 			}
 		})
+	}
+}
+
+// TestDeriveTransportKeys checks the keys against KDF2(C, empty), which
+// TestKDFIsHKDF already checks, and that the state is zeroed afterwards.
+func TestDeriveTransportKeys(t *testing.T) {
+	s := newHandshakeState(alicePublicKey(t))
+	s.mixKey([]byte("dh"))
+	before := *s
+
+	i2r, r2i := s.deriveTransportKeys()
+
+	wantI2R, wantR2I := kdf2(before.chainKey, nil)
+	if i2r != wantI2R {
+		t.Errorf("initiatorToResponder = %x, want T1 %x", i2r, wantI2R)
+	}
+	if r2i != wantR2I {
+		t.Errorf("responderToInitiator = %x, want T2 %x", r2i, wantR2I)
+	}
+	if i2r == r2i {
+		t.Error("the two transport keys are equal")
+	}
+	if *s != (handshakeState{}) {
+		t.Errorf("state after deriveTransportKeys = %x/%x, want zero", s.chainKey, s.hash)
+	}
+}
+
+// TestDeriveTransportKeysMakeSessions checks that two peers in the same state
+// get keys that work together: what one session seals, the other opens.
+func TestDeriveTransportKeysMakeSessions(t *testing.T) {
+	initiator, responder := newHandshakeState(alicePublicKey(t)), newHandshakeState(alicePublicKey(t))
+
+	iSend, iRecv := initiator.deriveTransportKeys()
+	rRecv, rSend := responder.deriveTransportKeys()
+
+	iSession, err := session.New(iSend, iRecv)
+	if err != nil {
+		t.Fatalf("session.New for the initiator: %v", err)
+	}
+	rSession, err := session.New(rSend, rRecv)
+	if err != nil {
+		t.Fatalf("session.New for the responder: %v", err)
+	}
+
+	for _, dir := range []struct {
+		name     string
+		from, to *session.Session
+	}{
+		{"initiator to responder", iSession, rSession},
+		{"responder to initiator", rSession, iSession},
+	} {
+		msg, err := dir.from.Seal(nil, []byte("packet"))
+		if err != nil {
+			t.Fatalf("%s: Seal: %v", dir.name, err)
+		}
+		got, err := dir.to.Open(nil, msg)
+		if err != nil {
+			t.Fatalf("%s: Open: %v", dir.name, err)
+		}
+		if string(got) != "packet" {
+			t.Errorf("%s: Open = %q, want %q", dir.name, got, "packet")
+		}
 	}
 }
