@@ -2,6 +2,7 @@ package noise
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 
@@ -189,5 +190,154 @@ func TestCreateInitiation(t *testing.T) {
 	}
 	if bytes.Equal(h.localEphemeral.PublicKey().Bytes(), firstEphemeral) {
 		t.Error("two calls used the same ephemeral key")
+	}
+}
+
+// responderHandshake returns Bob's side of a handshake with Alice.
+func responderHandshake(t *testing.T) *handshake {
+	t.Helper()
+	alice := privateKey(t, alicePrivate).PublicKey()
+	return newHandshake(privateKey(t, bobPrivate), alice)
+}
+
+// TestConsumeInitiation checks that Bob accepts Alice's message and ends in
+// the same state, which shows both sides took the same steps.
+func TestConsumeInitiation(t *testing.T) {
+	alice, bob := initiatorHandshake(t), responderHandshake(t)
+	b := createTestInitiation(t, alice)
+
+	if err := bob.consumeInitiation(b[:]); err != nil {
+		t.Fatalf("consumeInitiation: %v", err)
+	}
+
+	if *bob.state != *alice.state {
+		t.Errorf("states differ: initiator %x/%x, responder %x/%x",
+			alice.state.chainKey, alice.state.hash, bob.state.chainKey, bob.state.hash)
+	}
+	if bob.remoteIndex != testIndex {
+		t.Errorf("remoteIndex = %#x, want %#x", bob.remoteIndex, testIndex)
+	}
+	if want := alice.localEphemeral.PublicKey().Bytes(); !bytes.Equal(bob.remoteEphemeral.Bytes(), want) {
+		t.Errorf("remoteEphemeral = %x, want %x", bob.remoteEphemeral.Bytes(), want)
+	}
+	if want := tai64n(testTime); bob.lastTimestamp != want {
+		t.Errorf("lastTimestamp = %x, want %x", bob.lastTimestamp, want)
+	}
+}
+
+// TestConsumeInitiationNewerTimestamp checks that a later message from the
+// same peer is accepted after an earlier one.
+func TestConsumeInitiationNewerTimestamp(t *testing.T) {
+	bob := responderHandshake(t)
+
+	for i, now := range []time.Time{testTime, testTime.Add(time.Nanosecond), testTime.Add(time.Minute)} {
+		b, err := initiatorHandshake(t).createInitiationWith(privateKey(t, ephemeralPrivate), now, testIndex)
+		if err != nil {
+			t.Fatalf("createInitiationWith: %v", err)
+		}
+		if err := bob.consumeInitiation(b[:]); err != nil {
+			t.Fatalf("message %d: consumeInitiation: %v", i, err)
+		}
+	}
+}
+
+// resign returns a copy of b with byte i flipped and mac1 computed again for
+// Bob, so that the change reaches the checks after mac1.
+func resign(t *testing.T, b [initiationSize]byte, i int) []byte {
+	t.Helper()
+	c := b
+	c[i] ^= 0x01
+	setMAC1(c[:], initiationMAC1Offset, mac1Key(privateKey(t, bobPrivate).PublicKey()))
+	return c[:]
+}
+
+func TestConsumeInitiationRejects(t *testing.T) {
+	bobPublic := privateKey(t, bobPrivate).PublicKey()
+
+	charlie, err := identity.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	valid := createTestInitiation(t, initiatorHandshake(t))
+
+	// forAnotherResponder is Alice's message to Charlie instead of Bob.
+	forAnotherResponder := createTestInitiation(t, newHandshake(privateKey(t, alicePrivate), charlie.PublicKey()))
+	// fromUnknownPeer is Charlie's message to Bob: Charlie knows Bob's key,
+	// but Bob expects Alice.
+	fromUnknownPeer := createTestInitiation(t, newHandshake(charlie, bobPublic))
+
+	// older is Alice's message from a second before testTime.
+	older, err := initiatorHandshake(t).createInitiationWith(privateKey(t, ephemeralPrivate), testTime.Add(-time.Second), testIndex)
+	if err != nil {
+		t.Fatalf("createInitiationWith: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		// first, if set, is consumed successfully before b.
+		first   []byte
+		b       []byte
+		wantErr error
+	}{
+		{"too short", nil, valid[:initiationSize-1], errMessageSize},
+		{"wrong type", nil, resign(t, valid, 0), errMessageType},
+		{"for another responder", nil, forAnotherResponder[:], errInvalidMAC1},
+		{"changed byte without new mac1", nil, func() []byte { c := valid; c[50] ^= 1; return c[:] }(), errInvalidMAC1},
+		{"from an unknown peer", nil, fromUnknownPeer[:], errUnknownPeer},
+		{"changed ephemeral", nil, resign(t, valid, 8+31), errDecrypt},
+		{"changed encrypted static", nil, resign(t, valid, 40), errDecrypt},
+		{"changed encrypted timestamp", nil, resign(t, valid, 88), errDecrypt},
+		{"replayed", valid[:], valid[:], errReplayedTimestamp},
+		{"older timestamp", valid[:], older[:], errReplayedTimestamp},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bob := responderHandshake(t)
+			if tc.first != nil {
+				if err := bob.consumeInitiation(tc.first); err != nil {
+					t.Fatalf("consuming the first message: %v", err)
+				}
+			}
+			before := *bob
+
+			if err := bob.consumeInitiation(tc.b); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("consumeInitiation error = %v, want %v", err, tc.wantErr)
+			}
+			if *bob != before {
+				t.Error("a rejected message changed the handshake")
+			}
+		})
+	}
+}
+
+// TestConsumeInitiationAfterRejection checks that a forged message does not
+// stop the real one from being accepted afterwards.
+func TestConsumeInitiationAfterRejection(t *testing.T) {
+	bob := responderHandshake(t)
+	valid := createTestInitiation(t, initiatorHandshake(t))
+
+	if err := bob.consumeInitiation(resign(t, valid, 88)); err == nil {
+		t.Fatal("consumeInitiation accepted a changed timestamp")
+	}
+	if err := bob.consumeInitiation(valid[:]); err != nil {
+		t.Errorf("consumeInitiation of the real message after a forged one: %v", err)
+	}
+}
+
+// TestConsumeInitiationIndexIsNotEncrypted shows that the index is protected
+// only by mac1: it is not mixed into the hash, as in the whitepaper, so
+// someone who knows Bob's public key can change it and compute mac1 again.
+// That only lets them break the handshake, which they could do anyway.
+func TestConsumeInitiationIndexIsNotEncrypted(t *testing.T) {
+	bob := responderHandshake(t)
+	valid := createTestInitiation(t, initiatorHandshake(t))
+
+	if err := bob.consumeInitiation(resign(t, valid, 4)); err != nil {
+		t.Fatalf("consumeInitiation: %v", err)
+	}
+	if bob.remoteIndex == testIndex {
+		t.Error("remoteIndex is the original index, want the changed one")
 	}
 }
