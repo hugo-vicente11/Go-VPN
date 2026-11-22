@@ -22,8 +22,8 @@ type PrivateKey struct {
 // PublicKey is a peer's X25519 public key. It is not secret, and is given to
 // the other peer so it can identify this one.
 //
-// The zero value is not a valid key: get one from PrivateKey.PublicKey or
-// ParsePublicKey.
+// The zero value is not a valid key: get one from PrivateKey.PublicKey,
+// ParsePublicKey or NewPublicKey.
 type PublicKey struct {
 	key *ecdh.PublicKey
 }
@@ -65,6 +65,22 @@ func ParsePrivateKey(s string) (*PrivateKey, error) {
 	return &PrivateKey{key: privKey}, nil
 }
 
+// NewPublicKey returns the public key whose 32 raw bytes are b, the reverse
+// of Bytes. The handshake uses it for the keys it receives as bytes, such as
+// the peer's ephemeral key. It returns an error if b is not 32 bytes long.
+//
+// It copies b, so changing b afterwards does not change the key. Like
+// ParsePublicKey, it accepts some unsafe keys, such as all zeros; the
+// Diffie-Hellman step rejects them.
+func NewPublicKey(b []byte) (*PublicKey, error) {
+	key, err := ecdh.X25519().NewPublicKey(b)
+	if err != nil {
+		return nil, fmt.Errorf("identity: public key is not valid: %w", err)
+	}
+
+	return &PublicKey{key: key}, nil
+}
+
 // ParsePublicKey decodes a public key in standard base64 with padding, the
 // format String and wg pubkey produce. Surrounding whitespace is ignored.
 //
@@ -77,12 +93,7 @@ func ParsePublicKey(s string) (*PublicKey, error) {
 		return nil, fmt.Errorf("identity: public key is not valid base64: %w", err)
 	}
 
-	pubKey, err := ecdh.X25519().NewPublicKey(raw)
-	if err != nil {
-		return nil, fmt.Errorf("identity: public key is not valid: %w", err)
-	}
-
-	return &PublicKey{key: pubKey}, nil
+	return NewPublicKey(raw)
 }
 
 // String returns k in standard base64 with padding.

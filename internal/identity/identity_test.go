@@ -130,6 +130,69 @@ func TestPublicKeyBytes(t *testing.T) {
 	}
 }
 
+// TestNewPublicKeyRoundTrip checks that NewPublicKey reverses Bytes, with the
+// RFC 7748 key and a generated one.
+func TestNewPublicKeyRoundTrip(t *testing.T) {
+	keys := []struct {
+		name string
+		key  *PublicKey
+	}{
+		{"RFC 7748", publicKeyFromHex(t, rfc7748.alicePublic)},
+		{"generated", generate(t).PublicKey()},
+	}
+
+	for _, tc := range keys {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := NewPublicKey(tc.key.Bytes())
+			if err != nil {
+				t.Fatalf("NewPublicKey(Bytes()): %v", err)
+			}
+			if !bytes.Equal(got.Bytes(), tc.key.Bytes()) {
+				t.Errorf("NewPublicKey(Bytes()) = %x, want %x", got.Bytes(), tc.key.Bytes())
+			}
+		})
+	}
+}
+
+// TestNewPublicKeyCopies checks that changing the slice after NewPublicKey
+// does not change the key.
+func TestNewPublicKeyCopies(t *testing.T) {
+	b, err := hex.DecodeString(rfc7748.alicePublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	k, err := NewPublicKey(b)
+	if err != nil {
+		t.Fatalf("NewPublicKey: %v", err)
+	}
+	b[0] ^= 0xff
+
+	if got := hex.EncodeToString(k.Bytes()); got != rfc7748.alicePublic {
+		t.Errorf("after changing the slice, Bytes = %s, want %s", got, rfc7748.alicePublic)
+	}
+}
+
+func TestNewPublicKeyRejectsLength(t *testing.T) {
+	for _, n := range []int{0, 31, 33, 64} {
+		if _, err := NewPublicKey(make([]byte, n)); err == nil {
+			t.Errorf("NewPublicKey accepted %d bytes", n)
+		}
+	}
+}
+
+// TestParsePublicKeyErrorIsNotRepeated checks that an invalid key gives an
+// error with the identity prefix only once.
+func TestParsePublicKeyErrorIsNotRepeated(t *testing.T) {
+	_, err := ParsePublicKey(base64.StdEncoding.EncodeToString(make([]byte, 31)))
+	if err == nil {
+		t.Fatal("ParsePublicKey accepted a 31-byte key")
+	}
+	if n := strings.Count(err.Error(), "identity:"); n != 1 {
+		t.Errorf("error %q has the identity prefix %d times, want 1", err, n)
+	}
+}
+
 // TestPublicKeyBytesIsCopy checks that changing the slice Bytes returns does
 // not change the key.
 func TestPublicKeyBytesIsCopy(t *testing.T) {
