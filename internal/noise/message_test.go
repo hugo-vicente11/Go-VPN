@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"testing"
+
+	"github.com/hugo-vicente11/go-vpn/internal/identity"
 )
 
 // fill sets every byte of b to v, so that each field of a test message holds
@@ -216,4 +218,128 @@ func sameMessage(a, b unmarshaler) bool {
 		return *a == *b.(*responseMessage)
 	}
 	return false
+}
+
+// TestSetMAC1 checks setMAC1 against a value computed with Python's hashlib:
+// keyed BLAKE2s-128 with mac1Key of Alice's public key, over the first 116
+// bytes of testInitiation.
+func TestSetMAC1(t *testing.T) {
+	m := testInitiation()
+	b := m.marshal()
+
+	setMAC1(b[:], initiationMAC1Offset, mac1Key(alicePublicKey(t)))
+
+	checkHex(t, "mac1", b[initiationMAC1Offset:initiationMAC1Offset+16], "1b870cc322a03b6a2184d30e45c0efa0")
+}
+
+// TestSetMAC1ChangesOnlyMAC1 checks that setMAC1 leaves every byte outside the
+// mac1 field as it was.
+func TestSetMAC1ChangesOnlyMAC1(t *testing.T) {
+	m := testInitiation()
+	b := m.marshal()
+	before := b
+
+	setMAC1(b[:], initiationMAC1Offset, mac1Key(alicePublicKey(t)))
+
+	if !bytes.Equal(b[:initiationMAC1Offset], before[:initiationMAC1Offset]) {
+		t.Error("setMAC1 changed the bytes before mac1")
+	}
+	if !bytes.Equal(b[initiationMAC1Offset+16:], before[initiationMAC1Offset+16:]) {
+		t.Error("setMAC1 changed mac2")
+	}
+}
+
+// signedMessages returns a marshaled message of each type with mac1 set for
+// Alice's public key.
+func signedMessages(t *testing.T) []struct {
+	name   string
+	b      []byte
+	offset int
+} {
+	t.Helper()
+	key := mac1Key(alicePublicKey(t))
+
+	i, r := testInitiation(), testResponse()
+	ib, rb := i.marshal(), r.marshal()
+	setMAC1(ib[:], initiationMAC1Offset, key)
+	setMAC1(rb[:], responseMAC1Offset, key)
+
+	return []struct {
+		name   string
+		b      []byte
+		offset int
+	}{
+		{"initiation", ib[:], initiationMAC1Offset},
+		{"response", rb[:], responseMAC1Offset},
+	}
+}
+
+func TestVerifyMAC1Accepts(t *testing.T) {
+	key := mac1Key(alicePublicKey(t))
+
+	for _, msg := range signedMessages(t) {
+		t.Run(msg.name, func(t *testing.T) {
+			if err := verifyMAC1(msg.b, msg.offset, key); err != nil {
+				t.Errorf("verifyMAC1: %v", err)
+			}
+		})
+	}
+}
+
+// TestVerifyMAC1IgnoresMAC2 checks that mac2 is not covered by mac1, which
+// would fail if the offset were past the mac1 field.
+func TestVerifyMAC1IgnoresMAC2(t *testing.T) {
+	key := mac1Key(alicePublicKey(t))
+
+	for _, msg := range signedMessages(t) {
+		t.Run(msg.name, func(t *testing.T) {
+			msg.b[len(msg.b)-1] ^= 0x01
+			if err := verifyMAC1(msg.b, msg.offset, key); err != nil {
+				t.Errorf("verifyMAC1 after changing mac2: %v", err)
+			}
+		})
+	}
+}
+
+func TestVerifyMAC1Rejects(t *testing.T) {
+	key := mac1Key(alicePublicKey(t))
+
+	// Bob's public key from RFC 7748, section 6.1, as another receiver.
+	bob, err := identity.ParsePublicKey("3p7bfXt9wbTTW2HC7OQ1Nz+DQ8hbeGdNrfx+FG+IK08=")
+	if err != nil {
+		t.Fatalf("ParsePublicKey: %v", err)
+	}
+	otherKey := mac1Key(bob)
+
+	for _, msg := range signedMessages(t) {
+		// flipped returns a copy of the message with one bit of byte i flipped.
+		flipped := func(i int) []byte {
+			c := bytes.Clone(msg.b)
+			c[i] ^= 0x01
+			return c
+		}
+
+		tests := []struct {
+			name    string
+			b       []byte
+			key     [32]byte
+			wantErr error
+		}{
+			{"changed type", flipped(0), key, errInvalidMAC1},
+			{"changed byte before mac1", flipped(msg.offset - 1), key, errInvalidMAC1},
+			{"changed first mac1 byte", flipped(msg.offset), key, errInvalidMAC1},
+			{"changed last mac1 byte", flipped(msg.offset + 15), key, errInvalidMAC1},
+			{"other receiver's key", msg.b, otherKey, errInvalidMAC1},
+			{"cut inside mac1", msg.b[:msg.offset+15], key, errMessageSize},
+			{"empty", nil, key, errMessageSize},
+		}
+
+		for _, tc := range tests {
+			t.Run(msg.name+"/"+tc.name, func(t *testing.T) {
+				if err := verifyMAC1(tc.b, msg.offset, tc.key); !errors.Is(err, tc.wantErr) {
+					t.Errorf("verifyMAC1 error = %v, want %v", err, tc.wantErr)
+				}
+			})
+		}
+	}
 }

@@ -1,9 +1,11 @@
 package noise
 
 import (
+	gohmac "crypto/hmac"
 	"encoding/binary"
 	"errors"
 
+	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -35,6 +37,10 @@ var (
 	// errMessageType means the first 4 bytes are not the expected type
 	// followed by 3 zero bytes.
 	errMessageType = errors.New("noise: invalid message type")
+	// errInvalidMAC1 means the mac1 field is not the one computed with the
+	// receiver's public key: the sender does not know that key, or the
+	// message was changed.
+	errInvalidMAC1 = errors.New("noise: invalid mac1")
 )
 
 // initiationMessage is the first handshake message, from the initiator to
@@ -150,6 +156,41 @@ func (m *responseMessage) unmarshal(b []byte) error {
 	b = b[copy(m.encryptedNothing[:], b):]
 	b = b[copy(m.mac1[:], b):]
 	copy(m.mac2[:], b)
+
+	return nil
+}
+
+// setMAC1 computes mac1 = MAC(key, b[:offset]) and writes it at offset in b,
+// a marshaled message. key is mac1Key of the receiver's public key, and
+// offset is initiationMAC1Offset or responseMAC1Offset.
+//
+// b must be at least offset+16 bytes long, as marshal returns. setMAC1 does
+// not check it, because b always comes from marshal and never from the
+// network.
+func setMAC1(b []byte, offset int, key [32]byte) {
+	mac1 := mac(key, b[:offset])
+	copy(b[offset:], mac1[:])
+}
+
+// verifyMAC1 checks the mac1 field at offset in b, a message received from
+// the network. key is mac1Key of the receiver's own public key. It returns
+// errMessageSize if b is too short to hold mac1, and errInvalidMAC1 if mac1
+// is wrong.
+//
+// It is cheap, so the receiver calls it before any Diffie-Hellman, to drop
+// messages from anyone who does not know its public key. The comparison takes
+// the same time wherever the bytes differ, so that timing does not reveal
+// how much of a forged mac1 is right.
+func verifyMAC1(b []byte, offset int, key [32]byte) error {
+	if len(b) < offset+blake2s.Size128 {
+		return errMessageSize
+	}
+
+	want := mac(key, b[:offset])
+
+	if !gohmac.Equal(want[:], b[offset:offset+blake2s.Size128]) {
+		return errInvalidMAC1
+	}
 
 	return nil
 }
