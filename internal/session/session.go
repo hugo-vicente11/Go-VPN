@@ -23,6 +23,8 @@ type Session struct {
 	recvAEAD     cipher.AEAD
 	sendCounter  atomic.Uint64
 	replayWindow replayWindow
+	localIndex   uint32 // this side's index, which Open expects
+	remoteIndex  uint32 // the peer's index, which Seal writes
 }
 
 // Key is a symmetric key for sealing and opening transport data messages.
@@ -34,7 +36,6 @@ const (
 	HeaderSize     = 16
 	receiverOffset = 4
 	counterOffset  = 8
-	receiverIndex  = 0
 	// Overhead is the number of bytes Seal adds to a packet: the header and the tag.
 	Overhead     = HeaderSize + chacha20poly1305.Overhead
 	counterLimit = math.MaxUint64 - (1 << 13)
@@ -44,7 +45,7 @@ const (
 var (
 	// ErrShort means the message is shorter than a header and tag.
 	ErrShort = errors.New("session: message too short")
-	// ErrType means the message is not a transport data message for this session.
+	// ErrType means the message is not a transport data message.
 	ErrType = errors.New("session: invalid message type")
 	// ErrAuth means the message failed authentication: it was modified,
 	// corrupted, or sealed with a different key.
@@ -55,14 +56,24 @@ var (
 	// ErrReplay means the message was already opened, or is too old for the
 	// replay window to tell whether it was.
 	ErrReplay = errors.New("session: replayed or too old message")
+	// ErrWrongIndex means the message is for another receiver index, so it
+	// belongs to another session.
+	ErrWrongIndex = errors.New("session: message is for another receiver index")
 )
 
 // New returns a Session that seals messages with send and opens them with
 // recv. The peer's Session must use the same keys the other way around.
 //
+// remoteIndex is the index the peer chose in the handshake: Seal writes it in
+// the receiver field of every message, so the peer can tell which of its
+// sessions the message is for. localIndex is the index this side chose: Open
+// rejects messages that do not carry it. Each index sits in the same position
+// as the key it goes with, and the peer's Session takes the same two indices
+// the other way around.
+//
 // Nonces are unique only within one Session: a new Session with the same
 // send key starts its counter at 0 again and reuses nonces.
-func New(send, recv Key) (*Session, error) {
+func New(send, recv Key, remoteIndex, localIndex uint32) (*Session, error) {
 	sendAEAD, err := chacha20poly1305.New(send[:])
 	if err != nil {
 		return nil, err
@@ -73,7 +84,7 @@ func New(send, recv Key) (*Session, error) {
 		return nil, err
 	}
 
-	session := Session{sendAEAD: sendAEAD, recvAEAD: recvAEAD}
+	session := Session{sendAEAD: sendAEAD, recvAEAD: recvAEAD, localIndex: localIndex, remoteIndex: remoteIndex}
 	return &session, nil
 }
 
@@ -98,7 +109,7 @@ func (s *Session) Seal(dst, packet []byte) ([]byte, error) {
 
 	nonce := makeNonce(count)
 	dst = binary.LittleEndian.AppendUint32(dst, messageType)
-	dst = binary.LittleEndian.AppendUint32(dst, receiverIndex)
+	dst = binary.LittleEndian.AppendUint32(dst, s.remoteIndex)
 	dst = binary.LittleEndian.AppendUint64(dst, count)
 	return s.sendAEAD.Seal(dst, nonce[:], packet, nil), nil
 }
@@ -106,8 +117,10 @@ func (s *Session) Seal(dst, packet []byte) ([]byte, error) {
 // Open authenticates and decrypts a transport data message, appends the
 // packet to dst, and returns the updated slice. dst may be nil.
 //
-// It returns ErrShort, ErrType, or ErrAuth if msg is invalid, and ErrReplay
-// if msg was already opened or is too old to tell. Callers should drop
+// It returns ErrShort, ErrType, ErrWrongIndex, or ErrAuth if msg is invalid,
+// and ErrReplay if msg was already opened or is too old to tell. The index is
+// checked before decrypting, so a message for another session costs no
+// decryption. Callers should drop
 // invalid messages without replying.
 func (s *Session) Open(dst, msg []byte) ([]byte, error) {
 	if len(msg) < Overhead {
@@ -118,8 +131,8 @@ func (s *Session) Open(dst, msg []byte) ([]byte, error) {
 		return nil, ErrType
 	}
 
-	if binary.LittleEndian.Uint32(msg[receiverOffset:counterOffset]) != receiverIndex {
-		return nil, ErrType
+	if binary.LittleEndian.Uint32(msg[receiverOffset:counterOffset]) != s.localIndex {
+		return nil, ErrWrongIndex
 	}
 
 	counter := binary.LittleEndian.Uint64(msg[counterOffset:HeaderSize])

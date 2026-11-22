@@ -255,11 +255,12 @@ func TestDeriveTransportKeysMakeSessions(t *testing.T) {
 	iSend, iRecv := initiator.deriveTransportKeys()
 	rRecv, rSend := responder.deriveTransportKeys()
 
-	iSession, err := session.New(iSend, iRecv)
+	const initiatorIndex, responderIndex = 1, 2
+	iSession, err := session.New(iSend, iRecv, responderIndex, initiatorIndex)
 	if err != nil {
 		t.Fatalf("session.New for the initiator: %v", err)
 	}
-	rSession, err := session.New(rSend, rRecv)
+	rSession, err := session.New(rSend, rRecv, initiatorIndex, responderIndex)
 	if err != nil {
 		t.Fatalf("session.New for the responder: %v", err)
 	}

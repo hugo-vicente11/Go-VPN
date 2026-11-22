@@ -360,11 +360,12 @@ type forwardTest struct {
 func startForward(t *testing.T) *forwardTest {
 	t.Helper()
 	a, b := session.Key{1}, session.Key{2}
-	s, err := session.New(a, b)
+	const localIndex, peerIndex = 1, 2
+	s, err := session.New(a, b, peerIndex, localIndex)
 	if err != nil {
 		t.Fatalf("session.New: %v", err)
 	}
-	peer, err := session.New(b, a)
+	peer, err := session.New(b, a, localIndex, peerIndex)
 	if err != nil {
 		t.Fatalf("session.New: %v", err)
 	}

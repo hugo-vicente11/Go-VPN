@@ -18,23 +18,32 @@ var (
 	testKey  = Key{1, 2, 3}
 	otherKey = Key{4, 5, 6}
 
+	// testIndex is the index of the Sessions from newTestSession. Every byte
+	// is different, so a byte in the wrong place shows up.
+	testIndex uint32 = 0x01020304
+	// aliceIndex and bobIndex are the indices of the two ends of a tunnel.
+	aliceIndex uint32 = 0x0a0b0c0d
+	bobIndex   uint32 = 0x05060708
+
 	// testKeyB64 is a key in the format wg genkey produces, written by hand.
 	// It decodes to the bytes 0 to 31 (see testKeyB64Bytes), not to testKey.
 	testKeyB64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 )
 
-// newTestSession returns a Session that uses key in both directions, so it can
-// open its own messages. It fails the test if the Session cannot be created.
+// newTestSession returns a Session that uses key and testIndex in both
+// directions, so it can open its own messages. It fails the test if the
+// Session cannot be created.
 func newTestSession(t *testing.T, key Key) *Session {
 	t.Helper()
-	return newSession(t, key, key)
+	return newSession(t, key, key, testIndex, testIndex)
 }
 
-// newSession returns a Session that seals with send and opens with recv. It
-// fails the test if the Session cannot be created.
-func newSession(t *testing.T, send, recv Key) *Session {
+// newSession returns a Session that seals with send and remoteIndex, and
+// opens with recv and localIndex. It fails the test if the Session cannot be
+// created.
+func newSession(t *testing.T, send, recv Key, remoteIndex, localIndex uint32) *Session {
 	t.Helper()
-	s, err := New(send, recv)
+	s, err := New(send, recv, remoteIndex, localIndex)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -83,7 +92,7 @@ func TestSealKnownAnswer(t *testing.T) {
 
 	header := []byte{
 		4, 0, 0, 0, // type 4, then 3 reserved zero bytes
-		0, 0, 0, 0, // receiver index
+		4, 3, 2, 1, // receiver index, little-endian
 		8, 7, 6, 5, 4, 3, 2, 1, // counter, little-endian
 	}
 	nonce := []byte{
@@ -178,7 +187,7 @@ func TestOpenRejectsTampered(t *testing.T) {
 	}{
 		{"type", 0, ErrType},
 		{"reserved", 1, ErrType},
-		{"receiver index", receiverOffset, ErrType},
+		{"receiver index", receiverOffset, ErrWrongIndex},
 		{"counter", counterOffset, ErrAuth},
 		{"ciphertext", HeaderSize, ErrAuth},
 		{"tag", len(msg) - 1, ErrAuth},
@@ -193,6 +202,38 @@ func TestOpenRejectsTampered(t *testing.T) {
 				t.Errorf("Open: error = %v, want %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestSealWritesRemoteIndex checks that Seal writes the peer's index, not
+// this side's, so a swap of the two inside Session shows up.
+func TestSealWritesRemoteIndex(t *testing.T) {
+	s := newSession(t, testKey, testKey, bobIndex, aliceIndex)
+	msg := seal(t, s, []byte("hello"))
+
+	if got := binary.LittleEndian.Uint32(msg[receiverOffset:counterOffset]); got != bobIndex {
+		t.Errorf("receiver index = %#x, want the remote index %#x", got, bobIndex)
+	}
+}
+
+// TestOpenRejectsWrongIndex checks that Open rejects a message for another
+// index, even when the key is right, and that the rejection does not use up
+// the counter in the replay window: the real message, with the same counter,
+// still opens afterwards.
+func TestOpenRejectsWrongIndex(t *testing.T) {
+	alice := newSession(t, testKey, testKey, bobIndex, aliceIndex)
+	bob := newSession(t, testKey, testKey, aliceIndex, bobIndex)
+	msg := seal(t, alice, []byte("hello"))
+
+	// forAlice is the same message addressed to Alice's index instead.
+	forAlice := bytes.Clone(msg)
+	binary.LittleEndian.PutUint32(forAlice[receiverOffset:], aliceIndex)
+
+	if _, err := bob.Open(nil, forAlice); !errors.Is(err, ErrWrongIndex) {
+		t.Fatalf("Open: error = %v, want %v", err, ErrWrongIndex)
+	}
+	if _, err := bob.Open(nil, msg); err != nil {
+		t.Errorf("Open of the real message after a rejected one: %v", err)
 	}
 }
 
@@ -295,8 +336,8 @@ func TestOpenConcurrentReplay(t *testing.T) {
 // TestSessionPair checks two Sessions set up as the two ends of a tunnel,
 // each sealing with the key the other opens with.
 func TestSessionPair(t *testing.T) {
-	a := newSession(t, testKey, otherKey)
-	b := newSession(t, otherKey, testKey)
+	a := newSession(t, testKey, otherKey, bobIndex, aliceIndex)
+	b := newSession(t, otherKey, testKey, aliceIndex, bobIndex)
 	checkSessionPair(t, a, b)
 }
 
@@ -328,9 +369,11 @@ func checkSessionPair(t *testing.T, a, b *Session) {
 		}
 	})
 
+	// The message carries the other side's index and is sealed with the
+	// other side's key, so either check is enough to reject it.
 	t.Run("a side cannot open its own message", func(t *testing.T) {
-		if _, err := a.Open(nil, fromA); !errors.Is(err, ErrAuth) {
-			t.Errorf("Open: error = %v, want %v", err, ErrAuth)
+		if _, err := a.Open(nil, fromA); err == nil {
+			t.Error("a opened its own message")
 		}
 	})
 
@@ -412,7 +455,9 @@ func TestDerivedSessionPair(t *testing.T) {
 	iSend, iRecv := deriveKeys(t, testKey, true)
 	rSend, rRecv := deriveKeys(t, testKey, false)
 
-	checkSessionPair(t, newSession(t, iSend, iRecv), newSession(t, rSend, rRecv))
+	checkSessionPair(t,
+		newSession(t, iSend, iRecv, bobIndex, aliceIndex),
+		newSession(t, rSend, rRecv, aliceIndex, bobIndex))
 }
 
 // testKeyB64Bytes returns the key that testKeyB64 encodes: the bytes 0 to 31.
