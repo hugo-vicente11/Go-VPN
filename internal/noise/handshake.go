@@ -43,6 +43,12 @@ var (
 	// errNoInitiation means a response was asked for before an initiation
 	// message was accepted, so there is nothing to answer.
 	errNoInitiation = errors.New("noise: no initiation message was consumed")
+	// errNoInitiationCreated means a response arrived before this side
+	// created an initiation message, so it is not waiting for one.
+	errNoInitiationCreated = errors.New("noise: no initiation message was created")
+	// errUnknownIndex means the response echoes an index other than the one
+	// this side sent, so it answers some other initiation.
+	errUnknownIndex = errors.New("noise: the response is not for the index of this handshake")
 )
 
 // newHandshake returns a handshake between localStatic, this peer's private
@@ -264,4 +270,74 @@ func (h *handshake) createResponse() ([responseSize]byte, error) {
 	index := binary.LittleEndian.Uint32(randIndex[:])
 
 	return h.createResponseWith(localEphemeral, index)
+}
+
+// consumeResponse reads a response message as the initiator, the reverse of
+// createResponseWith. It runs the cheap checks first: the format, mac1 with
+// this peer's own public key, then that an initiation was created and that
+// the response echoes its index. It then repeats the responder's steps from
+// the other side: the ee and se Diffie-Hellman results and the preshared key
+// go into the chaining key, and the tag of the empty field must check out.
+// That tag proves the responder reached the same state, which needs the
+// responder's private key from the es step of the initiation, so it also
+// proves who answered.
+//
+// On success both sides hold the same state, ready for
+// deriveTransportKeys, and it keeps the responder's ephemeral key and index,
+// which transport data messages will carry. On error, h is unchanged. The
+// same response consumed twice fails, because the state has moved on.
+func (h *handshake) consumeResponse(b []byte) error {
+	var msg responseMessage
+	err := msg.unmarshal(b)
+	if err != nil {
+		return err
+	}
+
+	err = verifyMAC1(b, responseMAC1Offset, mac1Key(h.localStatic.PublicKey()))
+	if err != nil {
+		return err
+	}
+
+	if h.state == nil || h.localEphemeral == nil {
+		return errNoInitiationCreated
+	}
+
+	if msg.initiatorIndex != h.localIndex {
+		return errUnknownIndex
+	}
+
+	state := *h.state
+
+	state.mixHash(msg.ephemeral[:])
+	state.mixKey(msg.ephemeral[:])
+
+	remoteEphemeral, err := identity.NewPublicKey(msg.ephemeral[:])
+	if err != nil {
+		return err
+	}
+
+	dhEE, err := h.localEphemeral.SharedSecret(remoteEphemeral)
+	if err != nil {
+		return err
+	}
+	state.mixKey(dhEE[:])
+
+	dhSE, err := h.localStatic.SharedSecret(remoteEphemeral)
+	if err != nil {
+		return err
+	}
+	state.mixKey(dhSE[:])
+
+	k := state.mixKeyAndHash(h.presharedKey[:])
+
+	_, err = state.decryptAndHash(k, msg.encryptedNothing[:])
+	if err != nil {
+		return err
+	}
+
+	h.state = &state
+	h.remoteIndex = msg.responderIndex
+	h.remoteEphemeral = remoteEphemeral
+
+	return nil
 }

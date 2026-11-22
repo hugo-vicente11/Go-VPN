@@ -510,3 +510,159 @@ func TestCreateResponse(t *testing.T) {
 		t.Error("two calls used the same ephemeral key")
 	}
 }
+
+// aliceAfterResponse returns Alice's and Bob's handshakes after Bob created
+// his response, and the response, ready for Alice to consume it.
+func aliceAfterResponse(t *testing.T) (alice, bob *handshake, response [responseSize]byte) {
+	t.Helper()
+	alice, bob = bobAfterInitiation(t)
+	response = createTestResponse(t, bob)
+	return alice, bob, response
+}
+
+// TestConsumeResponse checks that Alice accepts Bob's response, ends in the
+// same state, and that both sides then get the same transport keys.
+func TestConsumeResponse(t *testing.T) {
+	alice, bob, b := aliceAfterResponse(t)
+
+	if err := alice.consumeResponse(b[:]); err != nil {
+		t.Fatalf("consumeResponse: %v", err)
+	}
+
+	if *alice.state != *bob.state {
+		t.Errorf("states differ: initiator %x/%x, responder %x/%x",
+			alice.state.chainKey, alice.state.hash, bob.state.chainKey, bob.state.hash)
+	}
+	if alice.remoteIndex != responderIndex {
+		t.Errorf("remoteIndex = %#x, want %#x", alice.remoteIndex, responderIndex)
+	}
+	if want := bob.localEphemeral.PublicKey().Bytes(); !bytes.Equal(alice.remoteEphemeral.Bytes(), want) {
+		t.Errorf("remoteEphemeral = %x, want %x", alice.remoteEphemeral.Bytes(), want)
+	}
+
+	aliceSend, aliceRecv := alice.state.deriveTransportKeys()
+	bobRecv, bobSend := bob.state.deriveTransportKeys()
+	if aliceSend != bobRecv {
+		t.Error("initiator-to-responder keys differ")
+	}
+	if aliceRecv != bobSend {
+		t.Error("responder-to-initiator keys differ")
+	}
+}
+
+// resignResponse returns a copy of b with byte i flipped and mac1 computed
+// again for Alice, so that the change reaches the checks after mac1.
+func resignResponse(t *testing.T, b [responseSize]byte, i int) []byte {
+	t.Helper()
+	c := b
+	c[i] ^= 0x01
+	setMAC1(c[:], responseMAC1Offset, mac1Key(privateKey(t, alicePrivate).PublicKey()))
+	return c[:]
+}
+
+func TestConsumeResponseRejects(t *testing.T) {
+	_, _, valid := aliceAfterResponse(t)
+
+	// otherPSK is a response from a Bob with a different preshared key.
+	_, bobWithPSK := bobAfterInitiation(t)
+	bobWithPSK.presharedKey[0] = 1
+	otherPSK := createTestResponse(t, bobWithPSK)
+
+	tests := []struct {
+		name string
+		// first, if set, is consumed successfully before b.
+		first   []byte
+		b       []byte
+		wantErr error
+	}{
+		{"too short", nil, valid[:responseSize-1], errMessageSize},
+		{"wrong type", nil, resignResponse(t, valid, 0), errMessageType},
+		{"changed byte without new mac1", nil, func() []byte { c := valid; c[50] ^= 1; return c[:] }(), errInvalidMAC1},
+		{"other initiator index", nil, resignResponse(t, valid, 8), errUnknownIndex},
+		{"changed ephemeral", nil, resignResponse(t, valid, 12), errDecrypt},
+		{"changed encrypted nothing", nil, resignResponse(t, valid, 44), errDecrypt},
+		{"other preshared key", nil, otherPSK[:], errDecrypt},
+		{"replayed", valid[:], valid[:], errDecrypt},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			alice, _, _ := aliceAfterResponse(t)
+			if tc.first != nil {
+				if err := alice.consumeResponse(tc.first); err != nil {
+					t.Fatalf("consuming the first message: %v", err)
+				}
+			}
+			before := *alice
+			stateBefore := *alice.state
+
+			if err := alice.consumeResponse(tc.b); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("consumeResponse error = %v, want %v", err, tc.wantErr)
+			}
+			if *alice != before || *alice.state != stateBefore {
+				t.Error("a rejected message changed the handshake")
+			}
+		})
+	}
+}
+
+// TestConsumeResponseWithoutInitiation checks that a valid response is
+// rejected by a handshake that created no initiation, which is left
+// unchanged.
+func TestConsumeResponseWithoutInitiation(t *testing.T) {
+	_, _, b := aliceAfterResponse(t)
+	h := initiatorHandshake(t)
+	before := *h
+
+	if err := h.consumeResponse(b[:]); !errors.Is(err, errNoInitiationCreated) {
+		t.Fatalf("consumeResponse error = %v, want %v", err, errNoInitiationCreated)
+	}
+	if *h != before {
+		t.Error("a rejected message changed the handshake")
+	}
+}
+
+// TestConsumeResponseAfterRejection checks that a forged response does not
+// stop the real one from being accepted afterwards.
+func TestConsumeResponseAfterRejection(t *testing.T) {
+	alice, _, valid := aliceAfterResponse(t)
+
+	if err := alice.consumeResponse(resignResponse(t, valid, 44)); err == nil {
+		t.Fatal("consumeResponse accepted a changed encrypted nothing")
+	}
+	if err := alice.consumeResponse(valid[:]); err != nil {
+		t.Errorf("consumeResponse of the real message after a forged one: %v", err)
+	}
+}
+
+// TestHandshake runs the whole handshake with random ephemeral keys, indices
+// and the current time, as the real program will, and checks that both sides
+// end with the same transport keys.
+func TestHandshake(t *testing.T) {
+	alice, bob := initiatorHandshake(t), responderHandshake(t)
+
+	initiation, err := alice.createInitiation()
+	if err != nil {
+		t.Fatalf("createInitiation: %v", err)
+	}
+	if err := bob.consumeInitiation(initiation[:]); err != nil {
+		t.Fatalf("consumeInitiation: %v", err)
+	}
+	response, err := bob.createResponse()
+	if err != nil {
+		t.Fatalf("createResponse: %v", err)
+	}
+	if err := alice.consumeResponse(response[:]); err != nil {
+		t.Fatalf("consumeResponse: %v", err)
+	}
+
+	if alice.remoteIndex != bob.localIndex || bob.remoteIndex != alice.localIndex {
+		t.Errorf("indices do not match: alice %#x/%#x, bob %#x/%#x",
+			alice.localIndex, alice.remoteIndex, bob.localIndex, bob.remoteIndex)
+	}
+	aliceSend, aliceRecv := alice.state.deriveTransportKeys()
+	bobRecv, bobSend := bob.state.deriveTransportKeys()
+	if aliceSend != bobRecv || aliceRecv != bobSend {
+		t.Error("the two sides got different transport keys")
+	}
+}
