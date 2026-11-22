@@ -2,6 +2,7 @@ package noise
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
@@ -664,5 +665,51 @@ func TestHandshake(t *testing.T) {
 	bobRecv, bobSend := bob.state.deriveTransportKeys()
 	if aliceSend != bobRecv || aliceRecv != bobSend {
 		t.Error("the two sides got different transport keys")
+	}
+}
+
+// TestHandshakeKnownAnswer checks the whole handshake against the values that
+// testdata/handshake_vectors.py computes: an independent implementation,
+// written from the whitepaper, with the same fixed keys, indices and time and
+// no preshared key. The other tests only show that both sides agree; this one
+// catches a mistake they share, such as a wrong constant or a step out of
+// order, which would break the handshake with any other WireGuard peer.
+func TestHandshakeKnownAnswer(t *testing.T) {
+	const (
+		wantInitiation = "01000000040302018f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f" +
+			"a6766329390656afa10f82819b732869ef96ee45b4fe4fc362db07b74cfc749ae66606f5fbeca63673" +
+			"d75505b7d68d8f290d458109520623a5642f7c468a1094b05bf240bd7d3c8052219fdaa70acba19730" +
+			"d1ef61cb6db683daa64200000000000000000000000000000000"
+		wantResponse = "020000000807060504030201358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2" +
+			"cd1662541df3b8c407577031807119a1502e36f75db07c27b709829f137d805c409b069000000000" +
+			"000000000000000000000000"
+		wantInitiatorToResponder = "35d8fc4c09c91e60f9797fe771cf57b17d88c579b53728664db4b46014116f8c"
+		wantResponderToInitiator = "cbf246d70fe49f90537537bbeb24e45c83b4459563e5288ec4d0f927384e7ecc"
+	)
+
+	alice, bob := initiatorHandshake(t), responderHandshake(t)
+
+	initiation := createTestInitiation(t, alice)
+	if got := hex.EncodeToString(initiation[:]); got != wantInitiation {
+		t.Fatalf("initiation:\n got %s\nwant %s", got, wantInitiation)
+	}
+	if err := bob.consumeInitiation(initiation[:]); err != nil {
+		t.Fatalf("consumeInitiation: %v", err)
+	}
+
+	response := createTestResponse(t, bob)
+	if got := hex.EncodeToString(response[:]); got != wantResponse {
+		t.Fatalf("response:\n got %s\nwant %s", got, wantResponse)
+	}
+	if err := alice.consumeResponse(response[:]); err != nil {
+		t.Fatalf("consumeResponse: %v", err)
+	}
+
+	initiatorToResponder, responderToInitiator := alice.state.deriveTransportKeys()
+	if got := hex.EncodeToString(initiatorToResponder[:]); got != wantInitiatorToResponder {
+		t.Errorf("initiatorToResponder = %s, want %s", got, wantInitiatorToResponder)
+	}
+	if got := hex.EncodeToString(responderToInitiator[:]); got != wantResponderToInitiator {
+		t.Errorf("responderToInitiator = %s, want %s", got, wantResponderToInitiator)
 	}
 }
