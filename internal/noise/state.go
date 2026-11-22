@@ -1,6 +1,9 @@
 package noise
 
-import "github.com/hugo-vicente11/go-vpn/internal/identity"
+import (
+	"github.com/hugo-vicente11/go-vpn/internal/identity"
+	"github.com/hugo-vicente11/go-vpn/internal/session"
+)
 
 // handshakeState is the state each peer keeps during a handshake: the
 // chaining key C and the hash H from the whitepaper.
@@ -64,4 +67,48 @@ func (s *handshakeState) mixKeyAndHash(input []byte) [32]byte {
 	s.mixHash(t[:])
 
 	return k
+}
+
+// encryptAndHash encrypts plaintext with key, using the hash as associated
+// data, then mixes the ciphertext (not the plaintext) into the hash and
+// returns it. The handshake uses it for the initiator's static key, the
+// timestamp and the empty field of the response.
+//
+// The nonce is always zero, so each key must encrypt only one field.
+func (s *handshakeState) encryptAndHash(key [32]byte, plaintext []byte) []byte {
+	ciphertext := aeadEncrypt(key, plaintext, s.hash[:])
+	s.mixHash(ciphertext)
+
+	return ciphertext
+}
+
+// decryptAndHash reverses encryptAndHash: it decrypts ciphertext with key,
+// using the hash as associated data, then mixes the ciphertext into the hash.
+// It returns errDecrypt if decryption fails, and then leaves the state
+// unchanged.
+func (s *handshakeState) decryptAndHash(key [32]byte, ciphertext []byte) ([]byte, error) {
+	plaintext, err := aeadDecrypt(key, ciphertext, s.hash[:])
+	if err != nil {
+		return nil, err
+	}
+
+	s.mixHash(ciphertext)
+
+	return plaintext, nil
+}
+
+// deriveTransportKeys returns the two transport data keys, the last step of
+// the handshake: T1, T2 = KDF2(C, empty). initiatorToResponder is T1 and
+// responderToInitiator is T2, so the initiator sends with the first and the
+// responder with the second.
+//
+// It then sets the chaining key and the hash to zero, as section 5.4.5 of the
+// whitepaper requires, so that C cannot later reveal the keys. The state must
+// not be used again after this call.
+func (s *handshakeState) deriveTransportKeys() (initiatorToResponder, responderToInitiator session.Key) {
+	initiatorToResponder, responderToInitiator = kdf2(s.chainKey, nil)
+	s.chainKey = [32]byte{}
+	s.hash = [32]byte{}
+
+	return initiatorToResponder, responderToInitiator
 }

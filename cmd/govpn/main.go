@@ -143,7 +143,8 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string, isIni
 		return fmt.Errorf("deriving keys from shared secret: %w", err)
 	}
 
-	s, err := session.New(sendKey, recvKey)
+	// Both indices are 0 until the handshake runs here and picks them.
+	s, err := session.New(sendKey, recvKey, 0, 0)
 	if err != nil {
 		return fmt.Errorf("creating session: %w", err)
 	}
