@@ -21,6 +21,7 @@ type handshake struct {
 	localStatic   *identity.PrivateKey // this peer's identity
 	remoteStatic  *identity.PublicKey  // the peer's identity, known in advance
 	lastTimestamp [12]byte             // newest TAI64N accepted from the peer
+	presharedKey  [32]byte             // Q in the whitepaper, zero without a PSK
 
 	state           *handshakeState      // C and H so far
 	localEphemeral  *identity.PrivateKey // this side's ephemeral key
@@ -29,9 +30,9 @@ type handshake struct {
 	remoteEphemeral *identity.PublicKey  // the peer's ephemeral key
 }
 
-// Errors returned when consuming a handshake message, besides the ones from
-// unmarshal, verifyMAC1 and decryption. Callers should drop the message
-// without replying.
+// Errors returned by the handshake, besides the ones from unmarshal,
+// verifyMAC1 and decryption. Callers should drop the message without
+// replying.
 var (
 	// errUnknownPeer means the message decrypted, so the sender knows this
 	// peer's public key, but its static key is not the configured peer's.
@@ -39,6 +40,9 @@ var (
 	// errReplayedTimestamp means the timestamp is not newer than the last one
 	// accepted, so the message may be an old one sent again.
 	errReplayedTimestamp = errors.New("noise: timestamp is not more recent than the last one")
+	// errNoInitiation means a response was asked for before an initiation
+	// message was accepted, so there is nothing to answer.
+	errNoInitiation = errors.New("noise: no initiation message was consumed")
 )
 
 // newHandshake returns a handshake between localStatic, this peer's private
@@ -185,4 +189,79 @@ func (h *handshake) consumeInitiation(b []byte) error {
 	copy(h.lastTimestamp[:], timestamp)
 
 	return nil
+}
+
+// createResponseWith creates the response message, the second message of the
+// handshake, as the responder, following section 5.4.3 of the whitepaper. It
+// continues from the state consumeInitiation left, and returns
+// errNoInitiation if there is none. It takes the ephemeral key and the index
+// as arguments, so that tests can fix them; createResponse picks them.
+//
+// The message gives the initiator this side's ephemeral key in the clear. Two
+// Diffie-Hellman results are mixed into the chaining key: ee, ephemeral with
+// ephemeral, for forward secrecy, and se, this side's ephemeral with the
+// initiator's static key, so that only the real initiator can follow. Then
+// the preshared key gives the only encryption key of the message, which
+// encrypts an empty field: its tag proves that this side reached the same
+// state. mac1 is set with the initiator's public key.
+//
+// On success it keeps the state, the ephemeral key and the index, which
+// transport data messages will carry. On error, h is unchanged.
+func (h *handshake) createResponseWith(ephemeral *identity.PrivateKey, index uint32) ([responseSize]byte, error) {
+	var msg responseMessage
+
+	if h.remoteEphemeral == nil {
+		return [responseSize]byte{}, errNoInitiation
+	}
+
+	state := *h.state
+	pubEphemeral := ephemeral.PublicKey().Bytes()
+	copy(msg.ephemeral[:], pubEphemeral)
+	state.mixHash(pubEphemeral)
+	state.mixKey(pubEphemeral)
+
+	dhEE, err := ephemeral.SharedSecret(h.remoteEphemeral)
+	if err != nil {
+		return [responseSize]byte{}, err
+	}
+	state.mixKey(dhEE[:])
+
+	dhSE, err := ephemeral.SharedSecret(h.remoteStatic)
+	if err != nil {
+		return [responseSize]byte{}, err
+	}
+	state.mixKey(dhSE[:])
+
+	k := state.mixKeyAndHash(h.presharedKey[:])
+	encryptedNothing := state.encryptAndHash(k, nil)
+	copy(msg.encryptedNothing[:], encryptedNothing)
+
+	msg.responderIndex = index
+	msg.initiatorIndex = h.remoteIndex
+
+	b := msg.marshal()
+	setMAC1(b[:], responseMAC1Offset, mac1Key(h.remoteStatic))
+
+	h.state = &state
+	h.localIndex = index
+	h.localEphemeral = ephemeral
+
+	return b, nil
+}
+
+// createResponse creates the response message with a new random ephemeral
+// key and a random index. See createResponseWith.
+func (h *handshake) createResponse() ([responseSize]byte, error) {
+	localEphemeral, err := identity.GeneratePrivateKey()
+	if err != nil {
+		return [responseSize]byte{}, err
+	}
+
+	var randIndex [4]byte
+	// rand.Read never returns an error: it crashes the program if the
+	// operating system cannot provide random bytes.
+	rand.Read(randIndex[:])
+	index := binary.LittleEndian.Uint32(randIndex[:])
+
+	return h.createResponseWith(localEphemeral, index)
 }

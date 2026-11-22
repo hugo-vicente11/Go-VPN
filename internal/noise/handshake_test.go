@@ -341,3 +341,172 @@ func TestConsumeInitiationIndexIsNotEncrypted(t *testing.T) {
 		t.Error("remoteIndex is the original index, want the changed one")
 	}
 }
+
+// responderIndex is the fixed index Bob passes to createResponseWith, and
+// responderEphemeral his fixed ephemeral key (the bytes 32 to 63).
+const (
+	responderIndex     = 0x05060708
+	responderEphemeral = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+)
+
+// bobAfterInitiation returns Alice's and Bob's handshakes after Bob accepted
+// Alice's initiation message, ready for Bob to respond.
+func bobAfterInitiation(t *testing.T) (alice, bob *handshake) {
+	t.Helper()
+	alice, bob = initiatorHandshake(t), responderHandshake(t)
+	b := createTestInitiation(t, alice)
+	if err := bob.consumeInitiation(b[:]); err != nil {
+		t.Fatalf("consumeInitiation: %v", err)
+	}
+	return alice, bob
+}
+
+// createTestResponse creates a response with Bob's fixed ephemeral key and
+// index.
+func createTestResponse(t *testing.T, bob *handshake) [responseSize]byte {
+	t.Helper()
+	b, err := bob.createResponseWith(privateKey(t, responderEphemeral), responderIndex)
+	if err != nil {
+		t.Fatalf("createResponseWith: %v", err)
+	}
+	return b
+}
+
+// TestCreateResponseFormat checks that the response parses, that mac1 is set
+// for the initiator, and that it carries both indices and Bob's ephemeral key.
+func TestCreateResponseFormat(t *testing.T) {
+	alice, bob := bobAfterInitiation(t)
+	b := createTestResponse(t, bob)
+
+	var msg responseMessage
+	if err := msg.unmarshal(b[:]); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if err := verifyMAC1(b[:], responseMAC1Offset, mac1Key(alice.localStatic.PublicKey())); err != nil {
+		t.Errorf("verifyMAC1 with the initiator's key: %v", err)
+	}
+	if msg.responderIndex != responderIndex {
+		t.Errorf("responderIndex = %#x, want %#x", msg.responderIndex, responderIndex)
+	}
+	if msg.initiatorIndex != testIndex {
+		t.Errorf("initiatorIndex = %#x, want the initiator's %#x", msg.initiatorIndex, testIndex)
+	}
+	if want := privateKey(t, responderEphemeral).PublicKey().Bytes(); !bytes.Equal(msg.ephemeral[:], want) {
+		t.Errorf("ephemeral = %x, want %x", msg.ephemeral, want)
+	}
+	if msg.mac2 != [16]byte{} {
+		t.Errorf("mac2 = %x, want zero", msg.mac2)
+	}
+}
+
+// TestCreateResponseKeepsState checks that Bob keeps his index and ephemeral
+// key, and that his state moved on from the one the initiation left.
+func TestCreateResponseKeepsState(t *testing.T) {
+	_, bob := bobAfterInitiation(t)
+	afterInitiation := *bob.state
+
+	createTestResponse(t, bob)
+
+	if bob.localIndex != responderIndex {
+		t.Errorf("localIndex = %#x, want %#x", bob.localIndex, responderIndex)
+	}
+	if bob.localEphemeral == nil || !bytes.Equal(bob.localEphemeral.PublicKey().Bytes(), privateKey(t, responderEphemeral).PublicKey().Bytes()) {
+		t.Error("localEphemeral is not the ephemeral key passed in")
+	}
+	if bob.state.chainKey == afterInitiation.chainKey || bob.state.hash == afterInitiation.hash {
+		t.Error("state did not change")
+	}
+}
+
+// TestCreateResponseIsDeterministic checks that the same inputs give the same
+// response, and that changing the ephemeral key or the index changes it.
+func TestCreateResponseIsDeterministic(t *testing.T) {
+	_, bob := bobAfterInitiation(t)
+	base := createTestResponse(t, bob)
+
+	_, bob = bobAfterInitiation(t)
+	if again := createTestResponse(t, bob); again != base {
+		t.Error("the same inputs gave different responses")
+	}
+
+	otherEphemeral, err := identity.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name      string
+		ephemeral *identity.PrivateKey
+		index     uint32
+	}{
+		{"other ephemeral key", otherEphemeral, responderIndex},
+		{"other index", privateKey(t, responderEphemeral), responderIndex + 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, bob := bobAfterInitiation(t)
+			b, err := bob.createResponseWith(tc.ephemeral, tc.index)
+			if err != nil {
+				t.Fatalf("createResponseWith: %v", err)
+			}
+			if b == base {
+				t.Error("the response did not change")
+			}
+		})
+	}
+}
+
+// TestCreateResponseWithoutInitiation checks that a response needs an
+// accepted initiation, including on a handshake that only created one, and
+// that the handshake is left unchanged.
+func TestCreateResponseWithoutInitiation(t *testing.T) {
+	onlyCreated := initiatorHandshake(t)
+	createTestInitiation(t, onlyCreated)
+
+	tests := []struct {
+		name string
+		h    *handshake
+	}{
+		{"new handshake", responderHandshake(t)},
+		{"after creating an initiation", onlyCreated},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			before := *tc.h
+			_, err := tc.h.createResponseWith(privateKey(t, responderEphemeral), responderIndex)
+			if !errors.Is(err, errNoInitiation) {
+				t.Fatalf("createResponseWith error = %v, want %v", err, errNoInitiation)
+			}
+			if *tc.h != before {
+				t.Error("a failed createResponseWith changed the handshake")
+			}
+		})
+	}
+}
+
+// TestCreateResponse checks the version with random inputs: the response is
+// valid, and two calls give different ephemeral keys and indices.
+func TestCreateResponse(t *testing.T) {
+	alice, bob := bobAfterInitiation(t)
+	first, err := bob.createResponse()
+	if err != nil {
+		t.Fatalf("createResponse: %v", err)
+	}
+	if err := verifyMAC1(first[:], responseMAC1Offset, mac1Key(alice.localStatic.PublicKey())); err != nil {
+		t.Errorf("verifyMAC1: %v", err)
+	}
+
+	_, bob2 := bobAfterInitiation(t)
+	second, err := bob2.createResponse()
+	if err != nil {
+		t.Fatalf("createResponse: %v", err)
+	}
+	if second == first {
+		t.Error("two calls gave the same response")
+	}
+	if bytes.Equal(bob.localEphemeral.PublicKey().Bytes(), bob2.localEphemeral.PublicKey().Bytes()) {
+		t.Error("two calls used the same ephemeral key")
+	}
+}
