@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -349,12 +348,12 @@ func (p *fakePipe) take(t *testing.T) []byte {
 	}
 }
 
-// forwardTest runs forward with fakes. It holds the session forward uses,
-// which a test can replace, and the peer's Session, which uses the same keys
-// the other way around.
+// forwardTest runs forward with fakes. It holds the peerState forward uses,
+// whose session a test can replace, and the peer's Session, which uses the
+// same keys the other way around.
 type forwardTest struct {
 	dev, conn *fakePipe
-	current   *atomic.Pointer[session.Session]
+	state     *peerState
 	peer      *session.Session
 	cancel    context.CancelFunc
 	result    chan error
@@ -379,23 +378,30 @@ func newSessionPair(t *testing.T, seed byte) (local, peer *session.Session) {
 }
 
 // startForward starts forward in the background with a session already in
-// place. When the test ends, it stops forward and fails the test if forward
-// does not return.
+// place and no handshake. When the test ends, it stops forward and fails the
+// test if forward does not return.
 func startForward(t *testing.T) *forwardTest {
+	t.Helper()
+	return startForwardWith(t, nil)
+}
+
+// startForwardWith is startForward with h as the handshake, so forward
+// answers handshake messages with it.
+func startForwardWith(t *testing.T, h *noise.Handshake) *forwardTest {
 	t.Helper()
 	s, peer := newSessionPair(t, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ft := &forwardTest{
-		dev:     newFakePipe(),
-		conn:    newFakePipe(),
-		current: new(atomic.Pointer[session.Session]),
-		peer:    peer,
-		cancel:  cancel,
-		result:  make(chan error, 1),
+		dev:    newFakePipe(),
+		conn:   newFakePipe(),
+		state:  &peerState{handshake: h},
+		peer:   peer,
+		cancel: cancel,
+		result: make(chan error, 1),
 	}
-	ft.current.Store(s)
-	go func() { ft.result <- forward(ctx, ft.dev, ft.conn, ft.current) }()
+	ft.state.sessionPointer.Store(s)
+	go func() { ft.result <- forward(ctx, ft.dev, ft.conn, ft.state) }()
 
 	t.Cleanup(func() {
 		cancel()
@@ -519,9 +525,9 @@ func message(typ uint32, size int) []byte {
 	return b
 }
 
-// TestForwardRoutesByType checks that only data messages reach the session:
-// handshake messages, unknown types and messages too short to hold a type
-// are dropped, without stopping forward.
+// TestForwardRoutesByType checks that only data messages reach the session
+// when there is no handshake: handshake messages, unknown types and messages
+// too short to hold a type are dropped, without stopping forward.
 func TestForwardRoutesByType(t *testing.T) {
 	ft := startForward(t)
 
@@ -562,12 +568,12 @@ func openAll(t *testing.T, s *session.Session, msgs ...[]byte) []string {
 // are dropped while there is no session, and sent once there is one.
 func TestForwardWithoutSessionDropsPackets(t *testing.T) {
 	ft := startForward(t)
-	ft.current.Store(nil)
+	ft.state.sessionPointer.Store(nil)
 
 	ft.dev.put(t, []byte("dropped"))
 	ft.dev.put(t, []byte("dropped too"))
 	s, peer := newSessionPair(t, 1)
-	ft.current.Store(s)
+	ft.state.sessionPointer.Store(s)
 	ft.dev.put(t, []byte("sent"))
 
 	got := openAll(t, peer, ft.conn.take(t))
@@ -583,7 +589,7 @@ func TestForwardWithoutSessionDropsPackets(t *testing.T) {
 // dropped while there is no session, and opened once there is one.
 func TestForwardWithoutSessionDropsMessages(t *testing.T) {
 	ft := startForward(t)
-	ft.current.Store(nil)
+	ft.state.sessionPointer.Store(nil)
 	s, peer := newSessionPair(t, 1)
 	seal := func(packet string) []byte {
 		msg, err := peer.Seal(nil, []byte(packet))
@@ -595,7 +601,7 @@ func TestForwardWithoutSessionDropsMessages(t *testing.T) {
 
 	ft.conn.put(t, seal("dropped"))
 	ft.conn.put(t, seal("dropped too"))
-	ft.current.Store(s)
+	ft.state.sessionPointer.Store(s)
 	ft.conn.put(t, seal("written"))
 
 	got := ft.dev.take(t)
@@ -619,7 +625,7 @@ func TestForwardUsesReplacedSession(t *testing.T) {
 	checkPacket(t, ft.dev.take(t), []byte("old"))
 
 	s, peer := newSessionPair(t, 1)
-	ft.current.Store(s)
+	ft.state.sessionPointer.Store(s)
 
 	ft.dev.put(t, []byte("new"))
 	if got := openAll(t, peer, ft.conn.take(t)); got[0] != "new" {
@@ -633,4 +639,169 @@ func TestForwardUsesReplacedSession(t *testing.T) {
 	ft.conn.put(t, ft.sealFromPeer(t, []byte("from the old peer")))
 	ft.conn.put(t, msg)
 	checkPacket(t, ft.dev.take(t), []byte("new"))
+}
+
+// newKey returns a new random private key, failing the test on error.
+func newKey(t *testing.T) *identity.PrivateKey {
+	t.Helper()
+	key, err := identity.GeneratePrivateKey()
+	if err != nil {
+		t.Fatalf("GeneratePrivateKey: %v", err)
+	}
+	return key
+}
+
+// newHandshakePair returns two Handshakes between two new key pairs: local
+// for forward, and peer for the test to play the other side.
+func newHandshakePair(t *testing.T) (local, peer *noise.Handshake) {
+	t.Helper()
+	localKey, peerKey := newKey(t), newKey(t)
+	return noise.NewHandshake(localKey, peerKey.PublicKey()), noise.NewHandshake(peerKey, localKey.PublicKey())
+}
+
+// checkTunnel fails the test unless forward and s work as the two ends of a
+// tunnel: a packet sealed with s reaches the device, and a packet from the
+// device opens with s.
+func checkTunnel(t *testing.T, ft *forwardTest, s *session.Session) {
+	t.Helper()
+	msg, err := s.Seal(nil, []byte("to the device"))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	ft.conn.put(t, msg)
+	checkPacket(t, ft.dev.take(t), []byte("to the device"))
+
+	ft.dev.put(t, []byte("from the device"))
+	if got := openAll(t, s, ft.conn.take(t)); got[0] != "from the device" {
+		t.Errorf("packet = %q, want %q", got[0], "from the device")
+	}
+}
+
+// checkNothingSent fails the test if forward sent anything on ft.conn. Call
+// it after taking a packet that forward handled last, so anything sent before
+// is already there.
+func checkNothingSent(t *testing.T, ft *forwardTest) {
+	t.Helper()
+	select {
+	case msg := <-ft.conn.out:
+		t.Errorf("forward sent %x, want nothing", msg)
+	default:
+	}
+}
+
+// TestForwardAnswersInitiation checks that forward, as the responder, answers
+// an initiation with a response that finishes the peer's handshake, and then
+// uses the new session.
+func TestForwardAnswersInitiation(t *testing.T) {
+	local, peer := newHandshakePair(t)
+	ft := startForwardWith(t, local)
+
+	initiation, err := peer.CreateInitiation()
+	if err != nil {
+		t.Fatalf("CreateInitiation: %v", err)
+	}
+	ft.conn.put(t, initiation)
+
+	if err := peer.ConsumeResponse(ft.conn.take(t)); err != nil {
+		t.Fatalf("ConsumeResponse(forward's response): %v", err)
+	}
+	s, err := peer.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	checkTunnel(t, ft, s)
+}
+
+// TestForwardFinishesHandshake checks that forward, as the initiator, finishes
+// the handshake when the response arrives, sends a keepalive with the new
+// session, and then uses that session.
+func TestForwardFinishesHandshake(t *testing.T) {
+	local, peer := newHandshakePair(t)
+	// forward does not send initiations yet, so create one before it starts.
+	initiation, err := local.CreateInitiation()
+	if err != nil {
+		t.Fatalf("CreateInitiation: %v", err)
+	}
+	ft := startForwardWith(t, local)
+
+	if err := peer.ConsumeInitiation(initiation); err != nil {
+		t.Fatalf("ConsumeInitiation: %v", err)
+	}
+	response, err := peer.CreateResponse()
+	if err != nil {
+		t.Fatalf("CreateResponse: %v", err)
+	}
+	s, err := peer.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	ft.conn.put(t, response)
+
+	if got := openAll(t, s, ft.conn.take(t)); got[0] != "" {
+		t.Errorf("first message after the response = %q, want a keepalive", got[0])
+	}
+	checkTunnel(t, ft, s)
+}
+
+// TestForwardDropsInvalidHandshakeMessages checks that handshake messages
+// that do not check out are dropped: forward sends nothing back, keeps its
+// session, and goes on.
+func TestForwardDropsInvalidHandshakeMessages(t *testing.T) {
+	localKey, peerKey := newKey(t), newKey(t)
+	ft := startForwardWith(t, noise.NewHandshake(localKey, peerKey.PublicKey()))
+
+	initiation, err := noise.NewHandshake(peerKey, localKey.PublicKey()).CreateInitiation()
+	if err != nil {
+		t.Fatalf("CreateInitiation: %v", err)
+	}
+	tampered := bytes.Clone(initiation)
+	tampered[20] ^= 1
+
+	// A stranger knows forward's public key, so its initiation passes mac1,
+	// but its static key is not the configured peer's.
+	stranger := noise.NewHandshake(newKey(t), localKey.PublicKey())
+	strangerInitiation, err := stranger.CreateInitiation()
+	if err != nil {
+		t.Fatalf("CreateInitiation: %v", err)
+	}
+
+	for _, msg := range [][]byte{
+		message(noise.InitiationType, 148),
+		initiation[:len(initiation)-1],
+		tampered,
+		strangerInitiation,
+		// forward sent no initiation, so no response can finish a handshake.
+		message(noise.ResponseType, 92),
+	} {
+		ft.conn.put(t, msg)
+	}
+	ft.conn.put(t, ft.sealFromPeer(t, []byte("data")))
+
+	checkPacket(t, ft.dev.take(t), []byte("data"))
+	checkNothingSent(t, ft)
+}
+
+// TestForwardDropsReplayedInitiation checks that an initiation is answered
+// only once. Answering a replay would replace the session with one the real
+// peer does not have, so anyone who saw the initiation could cut the tunnel.
+func TestForwardDropsReplayedInitiation(t *testing.T) {
+	local, peer := newHandshakePair(t)
+	ft := startForwardWith(t, local)
+
+	initiation, err := peer.CreateInitiation()
+	if err != nil {
+		t.Fatalf("CreateInitiation: %v", err)
+	}
+	ft.conn.put(t, initiation)
+	if err := peer.ConsumeResponse(ft.conn.take(t)); err != nil {
+		t.Fatalf("ConsumeResponse(forward's response): %v", err)
+	}
+	s, err := peer.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	ft.conn.put(t, initiation)
+	checkTunnel(t, ft, s)
+	checkNothingSent(t, ft)
 }

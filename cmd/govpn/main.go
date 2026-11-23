@@ -171,9 +171,9 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string, isIni
 	}
 	defer t.Close()
 
-	var sessionPointer atomic.Pointer[session.Session]
-	sessionPointer.Store(s)
-	return forward(ctx, dev, t, &sessionPointer)
+	var pState peerState
+	pState.sessionPointer.Store(s)
+	return forward(ctx, dev, t, &pState)
 }
 
 // validateTunnelAddr reports an error if p cannot be used as this peer's tunnel address.
@@ -294,20 +294,85 @@ type conn interface {
 	Close() error
 }
 
+// peerState is what forward keeps about the peer: the handshake with it and
+// the session that handshake gave.
+//
+// mu guards handshake, which is not safe for concurrent use. It is held only
+// while handshake runs, never while sending, so a slow send cannot hold up
+// another goroutine that needs the handshake. sessionPointer needs no lock:
+// forward loads it for every packet and message, and a finished handshake
+// replaces it. A peerState must not be copied, because it holds a mutex and
+// an atomic pointer.
+type peerState struct {
+	mu             sync.Mutex
+	handshake      *noise.Handshake // nil means this peer does not handshake
+	sessionPointer atomic.Pointer[session.Session]
+}
+
+// answerInitiation consumes an initiation message as the responder and
+// returns the response to send and the new session. It returns an error if
+// msg is not a valid initiation, and then the handshake is left as it was.
+func (p *peerState) answerInitiation(msg []byte) ([]byte, *session.Session, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	err := p.handshake.ConsumeInitiation(msg)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	resp, err := p.handshake.CreateResponse()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s, err := p.handshake.NewSession()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return resp, s, nil
+}
+
+// finishHandshake consumes a response message as the initiator and returns
+// the new session. It returns an error if msg is not a valid response to the
+// initiation this side sent, or if this side sent none.
+func (p *peerState) finishHandshake(msg []byte) (*session.Session, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	err := p.handshake.ConsumeResponse(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	s, err := p.handshake.NewSession()
+	if err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
 // forward moves packets in both directions until ctx is cancelled: it reads
 // packets from dev, seals them with the current session and sends them on c,
 // and it receives messages from c, opens them with the current session and
 // writes the packets to dev. It closes dev and c before it returns.
 //
-// The current session is the one sessionPointer holds when each packet or
-// message is handled, so another goroutine can replace it at any time. While
-// it is nil, because no handshake has finished, packets and data messages are
-// dropped. Received messages are routed by their type: data messages go to
-// the session, and any other type is dropped.
+// The current session is the one pState.sessionPointer holds when each
+// packet or message is handled, so another goroutine can replace it at any
+// time. While it is nil, because no handshake has finished, packets and data
+// messages are dropped.
+//
+// Received messages are routed by their type. Data messages go to the
+// current session. An initiation is answered with a response, and a response
+// is answered with a keepalive; each one makes a new session that replaces
+// the current one. Handshake messages are dropped if pState has no handshake
+// or if they are invalid, and any other type is dropped.
 //
 // It returns nil when ctx is cancelled, and an error if the current session
 // can no longer seal, because its send counter is exhausted.
-func forward(ctx context.Context, dev device, c conn, sessionPointer *atomic.Pointer[session.Session]) error {
+func forward(ctx context.Context, dev device, c conn, pState *peerState) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -339,11 +404,55 @@ func forward(ctx context.Context, dev device, c conn, sessionPointer *atomic.Poi
 			messageType := binary.LittleEndian.Uint32(recvBuf)
 
 			switch messageType {
-			case noise.InitiationType, noise.ResponseType:
-				// Handshake messages are not handled yet, so they are
-				// dropped.
+			case noise.InitiationType:
+				if pState.handshake == nil {
+					// This peer does not handshake, so the message
+					// cannot be answered.
+					continue
+				}
+
+				resp, s, err := pState.answerInitiation(recvBuf[:nRecv])
+				if err != nil {
+					// Drop invalid initiations silently, like invalid
+					// data messages: anyone can send them.
+					continue
+				}
+				// Store the session before sending, so it is in place
+				// when the initiator's first data message arrives.
+				pState.sessionPointer.Store(s)
+				err = c.Send(resp)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error while sending handshake response: %v\n", err)
+				}
+			case noise.ResponseType:
+				if pState.handshake == nil {
+					// This peer does not handshake, so it sent no
+					// initiation for this to answer.
+					continue
+				}
+
+				s, err := pState.finishHandshake(recvBuf[:nRecv])
+				if err != nil {
+					// Drop invalid responses silently: anyone can send
+					// them.
+					continue
+				}
+
+				pState.sessionPointer.Store(s)
+				// The keepalive is the first data message with the new
+				// session. It shows the responder that this side has the
+				// session too, even when there is no packet to send.
+				keepalive, err := s.Seal(nil, nil)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error while creating handshake keepalive: %v\n", err)
+					continue
+				}
+				err = c.Send(keepalive)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error while sending handshake keepalive: %v\n", err)
+				}
 			case session.DataMessageType:
-				s := sessionPointer.Load()
+				s := pState.sessionPointer.Load()
 				if s == nil {
 					// No handshake has finished, so there is no key to open
 					// the message with.
@@ -384,7 +493,7 @@ func forward(ctx context.Context, dev device, c conn, sessionPointer *atomic.Poi
 			fmt.Fprintf(os.Stderr, "Error while reading from %s: %v\n", dev.Name(), err)
 			continue
 		}
-		s := sessionPointer.Load()
+		s := pState.sessionPointer.Load()
 		if s == nil {
 			// No handshake has finished, so there is no key to seal the
 			// packet with. Drop it, as a network with no route would.
