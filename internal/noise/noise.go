@@ -1,5 +1,7 @@
-// Package noise implements the cryptographic primitives of the WireGuard
-// handshake, as defined in section 5.4 of the WireGuard whitepaper.
+// Package noise implements the WireGuard handshake, as defined in section 5.4
+// of the WireGuard whitepaper: two peers that know each other's static public
+// keys exchange two messages and get a session.Session with fresh keys. See
+// Handshake.
 package noise
 
 import (
