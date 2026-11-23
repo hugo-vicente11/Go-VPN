@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io/fs"
 	"net/netip"
@@ -10,10 +11,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hugo-vicente11/go-vpn/internal/identity"
+	"github.com/hugo-vicente11/go-vpn/internal/noise"
 	"github.com/hugo-vicente11/go-vpn/internal/session"
 )
 
@@ -346,39 +349,53 @@ func (p *fakePipe) take(t *testing.T) []byte {
 	}
 }
 
-// forwardTest runs forward with fakes, and holds the peer's Session, which
-// uses the same keys the other way around.
+// forwardTest runs forward with fakes. It holds the session forward uses,
+// which a test can replace, and the peer's Session, which uses the same keys
+// the other way around.
 type forwardTest struct {
 	dev, conn *fakePipe
+	current   *atomic.Pointer[session.Session]
 	peer      *session.Session
 	cancel    context.CancelFunc
 	result    chan error
 }
 
-// startForward starts forward in the background. When the test ends, it
-// stops forward and fails the test if forward does not return.
+// newSessionPair returns two Sessions that work as the two ends of a tunnel.
+// Each seed gives different keys, so pairs from different seeds cannot open
+// each other's messages.
+func newSessionPair(t *testing.T, seed byte) (local, peer *session.Session) {
+	t.Helper()
+	a, b := session.Key{seed, 1}, session.Key{seed, 2}
+	const localIndex, peerIndex = 1, 2
+	local, err := session.New(a, b, peerIndex, localIndex)
+	if err != nil {
+		t.Fatalf("session.New: %v", err)
+	}
+	peer, err = session.New(b, a, localIndex, peerIndex)
+	if err != nil {
+		t.Fatalf("session.New: %v", err)
+	}
+	return local, peer
+}
+
+// startForward starts forward in the background with a session already in
+// place. When the test ends, it stops forward and fails the test if forward
+// does not return.
 func startForward(t *testing.T) *forwardTest {
 	t.Helper()
-	a, b := session.Key{1}, session.Key{2}
-	const localIndex, peerIndex = 1, 2
-	s, err := session.New(a, b, peerIndex, localIndex)
-	if err != nil {
-		t.Fatalf("session.New: %v", err)
-	}
-	peer, err := session.New(b, a, localIndex, peerIndex)
-	if err != nil {
-		t.Fatalf("session.New: %v", err)
-	}
+	s, peer := newSessionPair(t, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ft := &forwardTest{
-		dev:    newFakePipe(),
-		conn:   newFakePipe(),
-		peer:   peer,
-		cancel: cancel,
-		result: make(chan error, 1),
+		dev:     newFakePipe(),
+		conn:    newFakePipe(),
+		current: new(atomic.Pointer[session.Session]),
+		peer:    peer,
+		cancel:  cancel,
+		result:  make(chan error, 1),
 	}
-	go func() { ft.result <- forward(ctx, ft.dev, ft.conn, s) }()
+	ft.current.Store(s)
+	go func() { ft.result <- forward(ctx, ft.dev, ft.conn, ft.current) }()
 
 	t.Cleanup(func() {
 		cancel()
@@ -492,4 +509,128 @@ func TestForwardStopsOnCancel(t *testing.T) {
 	if !ft.conn.closed() {
 		t.Error("forward did not close the conn")
 	}
+}
+
+// message returns a message of size bytes whose first 4 bytes hold typ, as a
+// little-endian uint32.
+func message(typ uint32, size int) []byte {
+	b := make([]byte, size)
+	binary.LittleEndian.PutUint32(b, typ)
+	return b
+}
+
+// TestForwardRoutesByType checks that only data messages reach the session:
+// handshake messages, unknown types and messages too short to hold a type
+// are dropped, without stopping forward.
+func TestForwardRoutesByType(t *testing.T) {
+	ft := startForward(t)
+
+	for _, msg := range [][]byte{
+		message(noise.InitiationType, 148),
+		message(noise.ResponseType, 92),
+		message(3, 64),
+		{byte(session.DataMessageType), 0, 0},
+	} {
+		ft.conn.put(t, msg)
+	}
+	ft.conn.put(t, ft.sealFromPeer(t, []byte("data")))
+
+	checkPacket(t, ft.dev.take(t), []byte("data"))
+}
+
+// openAll opens each message with s and returns the packets, failing the test
+// if one does not open.
+func openAll(t *testing.T, s *session.Session, msgs ...[]byte) []string {
+	t.Helper()
+	var packets []string
+	for _, msg := range msgs {
+		packet, err := s.Open(nil, msg)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		packets = append(packets, string(packet))
+	}
+	return packets
+}
+
+// The next two tests start with no session, then give forward one. forward
+// takes a packet only after it finished the one before, so once "dropped too"
+// is taken, "dropped" was handled with no session. "dropped too" itself may
+// be handled before or after the session arrives, so the tests allow both.
+
+// TestForwardWithoutSessionDropsPackets checks that packets from the device
+// are dropped while there is no session, and sent once there is one.
+func TestForwardWithoutSessionDropsPackets(t *testing.T) {
+	ft := startForward(t)
+	ft.current.Store(nil)
+
+	ft.dev.put(t, []byte("dropped"))
+	ft.dev.put(t, []byte("dropped too"))
+	s, peer := newSessionPair(t, 1)
+	ft.current.Store(s)
+	ft.dev.put(t, []byte("sent"))
+
+	got := openAll(t, peer, ft.conn.take(t))
+	if got[0] == "dropped too" {
+		got = openAll(t, peer, ft.conn.take(t))
+	}
+	if got[0] != "sent" {
+		t.Errorf("first packet sent = %q, want %q", got[0], "sent")
+	}
+}
+
+// TestForwardWithoutSessionDropsMessages checks that data messages are
+// dropped while there is no session, and opened once there is one.
+func TestForwardWithoutSessionDropsMessages(t *testing.T) {
+	ft := startForward(t)
+	ft.current.Store(nil)
+	s, peer := newSessionPair(t, 1)
+	seal := func(packet string) []byte {
+		msg, err := peer.Seal(nil, []byte(packet))
+		if err != nil {
+			t.Fatalf("Seal: %v", err)
+		}
+		return msg
+	}
+
+	ft.conn.put(t, seal("dropped"))
+	ft.conn.put(t, seal("dropped too"))
+	ft.current.Store(s)
+	ft.conn.put(t, seal("written"))
+
+	got := ft.dev.take(t)
+	if string(got) == "dropped too" {
+		got = ft.dev.take(t)
+	}
+	checkPacket(t, got, []byte("written"))
+}
+
+// TestForwardUsesReplacedSession checks that forward picks up a new session
+// for the next packet and message: packets are sealed for the new peer, and
+// messages from the old one no longer open.
+func TestForwardUsesReplacedSession(t *testing.T) {
+	ft := startForward(t)
+
+	// A round trip in each direction, so forward is waiting for the next
+	// packet and message when the session changes.
+	ft.dev.put(t, []byte("old"))
+	openAll(t, ft.peer, ft.conn.take(t))
+	ft.conn.put(t, ft.sealFromPeer(t, []byte("old")))
+	checkPacket(t, ft.dev.take(t), []byte("old"))
+
+	s, peer := newSessionPair(t, 1)
+	ft.current.Store(s)
+
+	ft.dev.put(t, []byte("new"))
+	if got := openAll(t, peer, ft.conn.take(t)); got[0] != "new" {
+		t.Errorf("packet = %q, want %q", got[0], "new")
+	}
+
+	msg, err := peer.Seal(nil, []byte("new"))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	ft.conn.put(t, ft.sealFromPeer(t, []byte("from the old peer")))
+	ft.conn.put(t, msg)
+	checkPacket(t, ft.dev.take(t), []byte("new"))
 }

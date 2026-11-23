@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,9 +13,11 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/hugo-vicente11/go-vpn/internal/identity"
+	"github.com/hugo-vicente11/go-vpn/internal/noise"
 	"github.com/hugo-vicente11/go-vpn/internal/session"
 	"github.com/hugo-vicente11/go-vpn/internal/transport"
 	"github.com/hugo-vicente11/go-vpn/internal/tun"
@@ -168,7 +171,9 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string, isIni
 	}
 	defer t.Close()
 
-	return forward(ctx, dev, t, s)
+	var sessionPointer atomic.Pointer[session.Session]
+	sessionPointer.Store(s)
+	return forward(ctx, dev, t, &sessionPointer)
 }
 
 // validateTunnelAddr reports an error if p cannot be used as this peer's tunnel address.
@@ -290,13 +295,19 @@ type conn interface {
 }
 
 // forward moves packets in both directions until ctx is cancelled: it reads
-// packets from dev, seals them with s and sends them on c, and it receives
-// messages from c, opens them with s and writes the packets to dev. It closes
-// dev and c before it returns.
+// packets from dev, seals them with the current session and sends them on c,
+// and it receives messages from c, opens them with the current session and
+// writes the packets to dev. It closes dev and c before it returns.
 //
-// It returns nil when ctx is cancelled, and an error if s can no longer seal,
-// because its send counter is exhausted.
-func forward(ctx context.Context, dev device, c conn, s *session.Session) error {
+// The current session is the one sessionPointer holds when each packet or
+// message is handled, so another goroutine can replace it at any time. While
+// it is nil, because no handshake has finished, packets and data messages are
+// dropped. Received messages are routed by their type: data messages go to
+// the session, and any other type is dropped.
+//
+// It returns nil when ctx is cancelled, and an error if the current session
+// can no longer seal, because its send counter is exhausted.
+func forward(ctx context.Context, dev device, c conn, sessionPointer *atomic.Pointer[session.Session]) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -319,25 +330,45 @@ func forward(ctx context.Context, dev device, c conn, s *session.Session) error 
 				fmt.Fprintf(os.Stderr, "Error while reading UDP payload: %v\n", err)
 				continue
 			}
-			packet, err := s.Open(recvBuf[session.HeaderSize:session.HeaderSize], recvBuf[:nRecv])
-			if err != nil {
-				// Drop invalid messages silently. Anyone can send datagrams to
-				// this port, so logging each one would let them flood the logs.
+
+			// Too short to hold a message type, so it is not a message.
+			if nRecv < 4 {
 				continue
 			}
 
-			if len(packet) == 0 {
-				// An empty packet is a keepalive: it only shows the peer is alive,
-				// so there is nothing to write to the TUN device.
-				continue
-			}
-			nWrite, err := dev.Write(packet)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error while writing into %s: %v\n", dev.Name(), err)
-				continue
-			}
-			if len(packet) != nWrite {
-				fmt.Fprintf(os.Stderr, "Did not write everything! wrote: %d expected %d\n", nWrite, len(packet))
+			messageType := binary.LittleEndian.Uint32(recvBuf)
+
+			switch messageType {
+			case noise.InitiationType, noise.ResponseType:
+				// Handshake messages are not handled yet, so they are
+				// dropped.
+			case session.DataMessageType:
+				s := sessionPointer.Load()
+				if s == nil {
+					// No handshake has finished, so there is no key to open
+					// the message with.
+					continue
+				}
+				packet, err := s.Open(recvBuf[session.HeaderSize:session.HeaderSize], recvBuf[:nRecv])
+				if err != nil {
+					// Drop invalid messages silently. Anyone can send datagrams to
+					// this port, so logging each one would let them flood the logs.
+					continue
+				}
+
+				if len(packet) == 0 {
+					// An empty packet is a keepalive: it only shows the peer is alive,
+					// so there is nothing to write to the TUN device.
+					continue
+				}
+				nWrite, err := dev.Write(packet)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error while writing into %s: %v\n", dev.Name(), err)
+					continue
+				}
+				if len(packet) != nWrite {
+					fmt.Fprintf(os.Stderr, "Did not write everything! wrote: %d expected %d\n", nWrite, len(packet))
+				}
 			}
 		}
 	}()
@@ -351,6 +382,12 @@ func forward(ctx context.Context, dev device, c conn, s *session.Session) error 
 				return nil
 			}
 			fmt.Fprintf(os.Stderr, "Error while reading from %s: %v\n", dev.Name(), err)
+			continue
+		}
+		s := sessionPointer.Load()
+		if s == nil {
+			// No handshake has finished, so there is no key to seal the
+			// packet with. Drop it, as a network with no route would.
 			continue
 		}
 		msg, err := s.Seal(readBuf[:0], readBuf[session.HeaderSize:session.HeaderSize+nRead])

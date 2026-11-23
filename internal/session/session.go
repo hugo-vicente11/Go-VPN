@@ -31,7 +31,9 @@ type Session struct {
 type Key [chacha20poly1305.KeySize]byte
 
 const (
-	messageType = 4
+	// DataMessageType is the type of a transport data message, in its first 4
+	// bytes as a little-endian uint32, like the handshake message types.
+	DataMessageType = 4
 	// HeaderSize is the size of a transport data message header.
 	HeaderSize     = 16
 	receiverOffset = 4
@@ -108,7 +110,7 @@ func (s *Session) Seal(dst, packet []byte) ([]byte, error) {
 	}
 
 	nonce := makeNonce(count)
-	dst = binary.LittleEndian.AppendUint32(dst, messageType)
+	dst = binary.LittleEndian.AppendUint32(dst, DataMessageType)
 	dst = binary.LittleEndian.AppendUint32(dst, s.remoteIndex)
 	dst = binary.LittleEndian.AppendUint64(dst, count)
 	return s.sendAEAD.Seal(dst, nonce[:], packet, nil), nil
@@ -127,7 +129,7 @@ func (s *Session) Open(dst, msg []byte) ([]byte, error) {
 		return nil, ErrShort
 	}
 
-	if binary.LittleEndian.Uint32(msg[:receiverOffset]) != messageType {
+	if binary.LittleEndian.Uint32(msg[:receiverOffset]) != DataMessageType {
 		return nil, ErrType
 	}
 
