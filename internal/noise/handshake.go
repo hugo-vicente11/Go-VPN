@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hugo-vicente11/go-vpn/internal/identity"
+	"github.com/hugo-vicente11/go-vpn/internal/session"
 )
 
 // handshake runs the WireGuard handshake with one peer, from this side.
@@ -28,7 +29,25 @@ type handshake struct {
 	localIndex      uint32               // this side's index, which the peer echoes
 	remoteIndex     uint32               // the peer's index, to echo back
 	remoteEphemeral *identity.PublicKey  // the peer's ephemeral key
+	stage           handshakeStage       // the last step this side completed
 }
+
+// handshakeStage is the last step of the handshake that this side completed.
+// Each step checks it, so that the messages can only come in order, and
+// newSession reads the role from it: only the initiator ends in
+// responseConsumedStage, and only the responder in responseCreatedStage.
+type handshakeStage uint8
+
+// The stages, in the order of the handshake. The initiator goes through
+// initiationCreatedStage and responseConsumedStage, and the responder through
+// initiationConsumedStage and responseCreatedStage.
+const (
+	nothingStage            handshakeStage = iota // no handshake in progress
+	initiationCreatedStage                        // createInitiation succeeded
+	initiationConsumedStage                       // consumeInitiation succeeded
+	responseCreatedStage                          // createResponse succeeded
+	responseConsumedStage                         // consumeResponse succeeded
+)
 
 // Errors returned by the handshake, besides the ones from unmarshal,
 // verifyMAC1 and decryption. Callers should drop the message without
@@ -40,15 +59,20 @@ var (
 	// errReplayedTimestamp means the timestamp is not newer than the last one
 	// accepted, so the message may be an old one sent again.
 	errReplayedTimestamp = errors.New("noise: timestamp is not more recent than the last one")
-	// errNoInitiation means a response was asked for before an initiation
-	// message was accepted, so there is nothing to answer.
+	// errNoInitiation means a response was asked for when the last step was
+	// not accepting an initiation message: none was accepted, or it was
+	// already answered.
 	errNoInitiation = errors.New("noise: no initiation message was consumed")
-	// errNoInitiationCreated means a response arrived before this side
-	// created an initiation message, so it is not waiting for one.
+	// errNoInitiationCreated means a response arrived when this side is not
+	// waiting for one: it created no initiation message, or it already
+	// consumed the response to it.
 	errNoInitiationCreated = errors.New("noise: no initiation message was created")
 	// errUnknownIndex means the response echoes an index other than the one
 	// this side sent, so it answers some other initiation.
 	errUnknownIndex = errors.New("noise: the response is not for the index of this handshake")
+	// errUnfinishedHandshake means a session was asked for before the
+	// handshake finished, so there are no transport keys yet.
+	errUnfinishedHandshake = errors.New("noise: handshake has not finished yet")
 )
 
 // newHandshake returns a handshake between localStatic, this peer's private
@@ -105,6 +129,7 @@ func (h *handshake) createInitiationWith(ephemeral *identity.PrivateKey, now tim
 	h.state = state
 	h.localEphemeral = ephemeral
 	h.localIndex = index
+	h.stage = initiationCreatedStage
 
 	return b, nil
 }
@@ -192,6 +217,7 @@ func (h *handshake) consumeInitiation(b []byte) error {
 	h.state = state
 	h.remoteEphemeral = remoteEphemeral
 	h.remoteIndex = msg.initiatorIndex
+	h.stage = initiationConsumedStage
 	copy(h.lastTimestamp[:], timestamp)
 
 	return nil
@@ -200,8 +226,9 @@ func (h *handshake) consumeInitiation(b []byte) error {
 // createResponseWith creates the response message, the second message of the
 // handshake, as the responder, following section 5.4.3 of the whitepaper. It
 // continues from the state consumeInitiation left, and returns
-// errNoInitiation if there is none. It takes the ephemeral key and the index
-// as arguments, so that tests can fix them; createResponse picks them.
+// errNoInitiation if that was not the last step. It takes the ephemeral key
+// and the index as arguments, so that tests can fix them; createResponse
+// picks them.
 //
 // The message gives the initiator this side's ephemeral key in the clear. Two
 // Diffie-Hellman results are mixed into the chaining key: ee, ephemeral with
@@ -216,7 +243,7 @@ func (h *handshake) consumeInitiation(b []byte) error {
 func (h *handshake) createResponseWith(ephemeral *identity.PrivateKey, index uint32) ([responseSize]byte, error) {
 	var msg responseMessage
 
-	if h.remoteEphemeral == nil {
+	if h.stage != initiationConsumedStage {
 		return [responseSize]byte{}, errNoInitiation
 	}
 
@@ -251,6 +278,7 @@ func (h *handshake) createResponseWith(ephemeral *identity.PrivateKey, index uin
 	h.state = &state
 	h.localIndex = index
 	h.localEphemeral = ephemeral
+	h.stage = responseCreatedStage
 
 	return b, nil
 }
@@ -285,7 +313,8 @@ func (h *handshake) createResponse() ([responseSize]byte, error) {
 // On success both sides hold the same state, ready for
 // deriveTransportKeys, and it keeps the responder's ephemeral key and index,
 // which transport data messages will carry. On error, h is unchanged. The
-// same response consumed twice fails, because the state has moved on.
+// same response consumed twice fails with errNoInitiationCreated, before any
+// Diffie-Hellman, because this side is no longer waiting for one.
 func (h *handshake) consumeResponse(b []byte) error {
 	var msg responseMessage
 	err := msg.unmarshal(b)
@@ -298,7 +327,7 @@ func (h *handshake) consumeResponse(b []byte) error {
 		return err
 	}
 
-	if h.state == nil || h.localEphemeral == nil {
+	if h.stage != initiationCreatedStage {
 		return errNoInitiationCreated
 	}
 
@@ -338,6 +367,39 @@ func (h *handshake) consumeResponse(b []byte) error {
 	h.state = &state
 	h.remoteIndex = msg.responderIndex
 	h.remoteEphemeral = remoteEphemeral
+	h.stage = responseConsumedStage
 
 	return nil
+}
+
+// newSession returns the session for transport data messages once the
+// handshake has finished: after consumeResponse on the initiator, or after
+// createResponse on the responder. Before that, it returns
+// errUnfinishedHandshake.
+//
+// Both sides derive the same two keys, and the stage tells which one this
+// side seals with: the initiator seals with the first and the responder with
+// the second. The session writes the peer's index and expects this side's.
+//
+// It then clears the handshake in progress, so that the ephemeral private key
+// does not stay in memory, which forward secrecy depends on, and so that a
+// second call fails instead of returning another session with the same keys,
+// whose counter would start again at 0 and reuse nonces.
+func (h *handshake) newSession() (*session.Session, error) {
+	var sendKey, recvKey session.Key
+	switch h.stage {
+	case responseConsumedStage:
+		sendKey, recvKey = h.state.deriveTransportKeys()
+	case responseCreatedStage:
+		recvKey, sendKey = h.state.deriveTransportKeys()
+	default:
+		return nil, errUnfinishedHandshake
+	}
+
+	h.state = nil
+	h.localEphemeral = nil
+	h.remoteEphemeral = nil
+	h.stage = nothingStage
+
+	return session.New(sendKey, recvKey, h.remoteIndex, h.localIndex)
 }
