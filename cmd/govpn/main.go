@@ -57,8 +57,8 @@ func main() {
 	flag.TextVar(&peer, "peer", netip.AddrPort{}, "peer to exchange messages with, as `ip:port`")
 	port := flag.Int("port", 9000, "local UDP `port` to listen on, must be between 1 and 65535")
 	flag.TextVar(&address, "address", netip.Prefix{}, "tunnel address of this peer, as `ip/len` (e.g. 10.0.0.1/24)")
-	keyFile := flag.String("key-file", "", "`path` to the base64 key file, readable only by its owner")
-	isInitiator := flag.Bool("initiator", false, "set on exactly one of the two peers: this peer encrypts with the initiator-to-responder key")
+	peerPublicKey := flag.String("peer-public-key", "", "the peer's public `key`, in base64, as govpn pubkey writes it")
+	privateKeyPath := flag.String("private-key-file", "", "`path` to the base64 private key file, readable only by its owner")
 
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
@@ -66,15 +66,17 @@ func main() {
 other peers.
 
 Usage:
-  govpn -peer ip:port -address ip/len -key-file path [-port port] [-initiator]
+  govpn -peer ip:port -address ip/len -private-key-file path -peer-public-key key [-port port]
   (umask 077; govpn genkey > private.key)
   govpn pubkey < private.key > public.key
 
 genkey writes a new private key; pubkey reads one and writes its public key.
 
 Example (two-namespace lab, see scripts/lab-up.sh):
-  sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24 -key-file govpn.key -initiator
-  sudo ip netns exec B ./bin/govpn -peer 192.168.50.1:9000 -address 10.0.0.2/24 -key-file govpn.key
+  (umask 077; ./bin/govpn genkey > a.key; ./bin/govpn genkey > b.key)
+  ./bin/govpn pubkey < a.key > a.pub; ./bin/govpn pubkey < b.key > b.pub
+  sudo ip netns exec A ./bin/govpn -peer 192.168.50.2:9000 -address 10.0.0.1/24 -private-key-file a.key -peer-public-key "$(cat b.pub)"
+  sudo ip netns exec B ./bin/govpn -peer 192.168.50.1:9000 -address 10.0.0.2/24 -private-key-file b.key -peer-public-key "$(cat a.pub)"
   sudo ip netns exec A ping 10.0.0.2
 
 Flags:
@@ -92,8 +94,16 @@ Flags:
 		flagErrorf("-peer is required")
 	}
 
-	if *keyFile == "" {
-		flagErrorf("-key-file is required")
+	if *peerPublicKey == "" {
+		flagErrorf("-peer-public-key is required")
+	}
+	peerPublic, err := identity.ParsePublicKey(*peerPublicKey)
+	if err != nil {
+		flagErrorf("-peer-public-key %v", err)
+	}
+
+	if *privateKeyPath == "" {
+		flagErrorf("-private-key-file is required")
 	}
 
 	if err := validateTunnelAddr(address); err != nil {
@@ -104,7 +114,7 @@ Flags:
 		flagErrorf("-port must be between 1 and 65535, got %d", *port)
 	}
 
-	if err := run(*port, peer, address, *keyFile, *isInitiator); err != nil {
+	if err := run(*port, peer, address, *privateKeyPath, peerPublic); err != nil {
 		log.Fatal(err)
 	}
 
@@ -132,25 +142,20 @@ func flagErrorf(format string, args ...any) {
 	os.Exit(2)
 }
 
-func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string, isInitiator bool) error {
+func run(port int, peer netip.AddrPort, addr netip.Prefix, privateKeyFile string, peerPublic *identity.PublicKey) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	key, err := loadKey(keyFile)
+	key, err := loadPrivateKey(privateKeyFile)
 	if err != nil {
 		return err
 	}
 
-	sendKey, recvKey, err := session.DeriveKeys(key, isInitiator)
-	if err != nil {
-		return fmt.Errorf("deriving keys from shared secret: %w", err)
+	if err := checkPeerPublicKey(key, peerPublic); err != nil {
+		return err
 	}
 
-	// Both indices are 0 until the handshake runs here and picks them.
-	s, err := session.New(sendKey, recvKey, 0, 0)
-	if err != nil {
-		return fmt.Errorf("creating session: %w", err)
-	}
+	handshake := noise.NewHandshake(key, peerPublic)
 
 	// Create TUN interface
 	dev, err := tun.New()
@@ -172,7 +177,7 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix, keyFile string, isIni
 	defer t.Close()
 
 	var pState peerState
-	pState.sessionPointer.Store(s)
+	pState.handshake = handshake
 	return forward(ctx, dev, t, &pState)
 }
 
@@ -197,35 +202,48 @@ func validateTunnelAddr(p netip.Prefix) error {
 	return nil
 }
 
-// loadKey reads the key from the file at path. It refuses files that group
-// or others can access, because anyone who can read the key can decrypt
-// the tunnel.
-func loadKey(path string) (session.Key, error) {
+// errOwnPublicKey means -peer-public-key is this peer's own public key, so the
+// peer would try to handshake with itself.
+var errOwnPublicKey = errors.New("-peer-public-key is this peer's own public key; pass the other peer's key")
+
+// checkPeerPublicKey returns errOwnPublicKey if peer is the public key of
+// private, a likely mix-up of the two peers' keys.
+func checkPeerPublicKey(private *identity.PrivateKey, peer *identity.PublicKey) error {
+	if private.PublicKey().String() == peer.String() {
+		return errOwnPublicKey
+	}
+	return nil
+}
+
+// loadPrivateKey reads this peer's private key from the file at path. It
+// refuses files that group or others can access, because anyone who can read
+// the key can pretend to be this peer.
+func loadPrivateKey(path string) (*identity.PrivateKey, error) {
 	// Check and read the same open file, so it cannot be swapped in between.
 	f, err := os.Open(path)
 	if err != nil {
-		return session.Key{}, fmt.Errorf("opening key file: %w", err)
+		return nil, fmt.Errorf("opening key file: %w", err)
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return session.Key{}, fmt.Errorf("checking key file: %w", err)
+		return nil, fmt.Errorf("checking key file: %w", err)
 	}
 
 	perms := info.Mode().Perm()
 	if perms&0o077 != 0 {
-		return session.Key{}, fmt.Errorf("key file %s is accessible by other users (mode %#o); run: chmod 600 %s", path, perms, path)
+		return nil, fmt.Errorf("key file %s is accessible by other users (mode %#o); run: chmod 600 %s", path, perms, path)
 	}
 
 	fileContents, err := io.ReadAll(f)
 	if err != nil {
-		return session.Key{}, fmt.Errorf("reading key file: %w", err)
+		return nil, fmt.Errorf("reading key file: %w", err)
 	}
 
-	key, err := session.ParseKey(string(fileContents))
+	key, err := identity.ParsePrivateKey(string(fileContents))
 	if err != nil {
-		return session.Key{}, fmt.Errorf("key file %s: %w", path, err)
+		return nil, fmt.Errorf("key file %s: %w", path, err)
 	}
 
 	return key, nil

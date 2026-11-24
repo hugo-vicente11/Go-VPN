@@ -58,15 +58,12 @@ func TestValidateTunnelAddrSuggestsHost(t *testing.T) {
 	}
 }
 
-// testKeyFileContent is a key file as wg genkey writes it, with a trailing
-// newline. It decodes to the bytes 0 to 31.
+// testKeyFileContent is a private key file as wg genkey writes it, with a
+// trailing newline. It decodes to the bytes 0 to 31.
 const testKeyFileContent = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\n"
 
-func TestLoadKey(t *testing.T) {
-	var want session.Key
-	for i := range want {
-		want[i] = byte(i)
-	}
+func TestLoadPrivateKey(t *testing.T) {
+	want := strings.TrimSpace(testKeyFileContent)
 
 	tests := []struct {
 		name    string
@@ -83,7 +80,7 @@ func TestLoadKey(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "govpn.key")
+			path := filepath.Join(t.TempDir(), "private.key")
 			if tc.content != "" {
 				if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
 					t.Fatal(err)
@@ -94,37 +91,37 @@ func TestLoadKey(t *testing.T) {
 				}
 			}
 
-			got, err := loadKey(path)
+			got, err := loadPrivateKey(path)
 			if tc.wantErr == "" {
 				if err != nil {
-					t.Fatalf("loadKey: %v", err)
+					t.Fatalf("loadPrivateKey: %v", err)
 				}
-				if got != want {
-					t.Errorf("loadKey = %x, want %x", got, want)
+				if enc := got.Encode(); enc != want {
+					t.Errorf("loadPrivateKey = %s, want %s", enc, want)
 				}
 				return
 			}
 
 			if err == nil {
-				t.Fatalf("loadKey returned nil error, want one containing %q", tc.wantErr)
+				t.Fatalf("loadPrivateKey returned nil error, want one containing %q", tc.wantErr)
 			}
 			if msg := err.Error(); !strings.Contains(msg, tc.wantErr) {
-				t.Errorf("loadKey error = %q, want it to contain %q", msg, tc.wantErr)
+				t.Errorf("loadPrivateKey error = %q, want it to contain %q", msg, tc.wantErr)
 			}
 			// Every error must name the file, so the user knows which one to fix.
 			if msg := err.Error(); !strings.Contains(msg, path) {
-				t.Errorf("loadKey error = %q, want it to name %s", msg, path)
+				t.Errorf("loadPrivateKey error = %q, want it to name %s", msg, path)
 			}
 		})
 	}
 }
 
-// TestLoadKeyMissingIsNotExist checks that a missing file can still be
-// recognized with errors.Is after loadKey wraps the error.
-func TestLoadKeyMissingIsNotExist(t *testing.T) {
-	_, err := loadKey(filepath.Join(t.TempDir(), "missing.key"))
+// TestLoadPrivateKeyMissingIsNotExist checks that a missing file can still be
+// recognized with errors.Is after loadPrivateKey wraps the error.
+func TestLoadPrivateKeyMissingIsNotExist(t *testing.T) {
+	_, err := loadPrivateKey(filepath.Join(t.TempDir(), "missing.key"))
 	if !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("loadKey error = %v, want it to wrap %v", err, fs.ErrNotExist)
+		t.Errorf("loadPrivateKey error = %v, want it to wrap %v", err, fs.ErrNotExist)
 	}
 }
 
@@ -804,4 +801,22 @@ func TestForwardDropsReplayedInitiation(t *testing.T) {
 	ft.conn.put(t, initiation)
 	checkTunnel(t, ft, s)
 	checkNothingSent(t, ft)
+}
+
+func TestCheckPeerPublicKey(t *testing.T) {
+	private, err := identity.ParsePrivateKey(alicePrivate)
+	if err != nil {
+		t.Fatalf("ParsePrivateKey: %v", err)
+	}
+	other, err := identity.GeneratePrivateKey()
+	if err != nil {
+		t.Fatalf("GeneratePrivateKey: %v", err)
+	}
+
+	if err := checkPeerPublicKey(private, private.PublicKey()); !errors.Is(err, errOwnPublicKey) {
+		t.Errorf("own public key: error = %v, want %v", err, errOwnPublicKey)
+	}
+	if err := checkPeerPublicKey(private, other.PublicKey()); err != nil {
+		t.Errorf("other peer's public key: error = %v, want nil", err)
+	}
 }
