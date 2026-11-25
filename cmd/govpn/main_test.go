@@ -383,21 +383,36 @@ func startForward(t *testing.T) *forwardTest {
 }
 
 // startForwardWith is startForward with h as the handshake, so forward
-// answers handshake messages with it.
+// answers handshake messages with it. A session is already in place, so
+// forward sends no initiations.
 func startForwardWith(t *testing.T, h *noise.Handshake) *forwardTest {
 	t.Helper()
 	s, peer := newSessionPair(t, 0)
+	state := &peerState{handshake: h, retryInterval: time.Hour}
+	state.sessionPointer.Store(s)
+	return launchForward(t, state, peer)
+}
 
+// startHandshakingForward starts forward with h and no session, as govpn
+// starts, so forward sends an initiation at once and again every interval.
+func startHandshakingForward(t *testing.T, h *noise.Handshake, interval time.Duration) *forwardTest {
+	t.Helper()
+	return launchForward(t, &peerState{handshake: h, retryInterval: interval}, nil)
+}
+
+// launchForward runs forward with state in the background. When the test
+// ends, it stops forward and fails the test if forward does not return.
+func launchForward(t *testing.T, state *peerState, peer *session.Session) *forwardTest {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	ft := &forwardTest{
 		dev:    newFakePipe(),
 		conn:   newFakePipe(),
-		state:  &peerState{handshake: h},
+		state:  state,
 		peer:   peer,
 		cancel: cancel,
 		result: make(chan error, 1),
 	}
-	ft.state.sessionPointer.Store(s)
 	go func() { ft.result <- forward(ctx, ft.dev, ft.conn, ft.state) }()
 
 	t.Cleanup(func() {
@@ -714,29 +729,9 @@ func TestForwardAnswersInitiation(t *testing.T) {
 // session, and then uses that session.
 func TestForwardFinishesHandshake(t *testing.T) {
 	local, peer := newHandshakePair(t)
-	// forward does not send initiations yet, so create one before it starts.
-	initiation, err := local.CreateInitiation()
-	if err != nil {
-		t.Fatalf("CreateInitiation: %v", err)
-	}
-	ft := startForwardWith(t, local)
+	ft := startHandshakingForward(t, local, 50*time.Millisecond)
 
-	if err := peer.ConsumeInitiation(initiation); err != nil {
-		t.Fatalf("ConsumeInitiation: %v", err)
-	}
-	response, err := peer.CreateResponse()
-	if err != nil {
-		t.Fatalf("CreateResponse: %v", err)
-	}
-	s, err := peer.NewSession()
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	ft.conn.put(t, response)
-
-	if got := openAll(t, s, ft.conn.take(t)); got[0] != "" {
-		t.Errorf("first message after the response = %q, want a keepalive", got[0])
-	}
+	s := completeHandshake(t, ft, peer)
 	checkTunnel(t, ft, s)
 }
 
@@ -818,5 +813,116 @@ func TestCheckPeerPublicKey(t *testing.T) {
 	}
 	if err := checkPeerPublicKey(private, other.PublicKey()); err != nil {
 		t.Errorf("other peer's public key: error = %v, want nil", err)
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	for _, interval := range []time.Duration{0, 1, 2, 3, 30 * time.Millisecond, 5 * time.Second} {
+		for range 100 {
+			got := retryDelay(interval)
+			if got < interval || got > interval+interval/3 {
+				t.Fatalf("retryDelay(%v) = %v, want between %v and %v", interval, got, interval, interval+interval/3)
+			}
+		}
+	}
+}
+
+// checkInitiation fails the test if msg is not a handshake initiation.
+func checkInitiation(t *testing.T, msg []byte) {
+	t.Helper()
+	if len(msg) != 148 || binary.LittleEndian.Uint32(msg) != noise.InitiationType {
+		t.Fatalf("message = %d bytes of type %d, want a 148-byte initiation", len(msg), binary.LittleEndian.Uint32(msg))
+	}
+}
+
+// completeHandshake answers forward's initiations as the peer until forward
+// sends the keepalive that ends the handshake, and returns the peer's session
+// that opens it. forward may send a new initiation before a response
+// arrives, which makes that response stale, so the loop answers every one.
+func completeHandshake(t *testing.T, ft *forwardTest, peer *noise.Handshake) *session.Session {
+	t.Helper()
+	var sessions []*session.Session
+	deadline := time.After(testTimeout)
+	for {
+		var msg []byte
+		select {
+		case msg = <-ft.conn.out:
+		case <-deadline:
+			t.Fatal("the handshake did not finish in time")
+		}
+
+		if binary.LittleEndian.Uint32(msg) == noise.InitiationType {
+			if err := peer.ConsumeInitiation(msg); err != nil {
+				t.Fatalf("ConsumeInitiation: %v", err)
+			}
+			response, err := peer.CreateResponse()
+			if err != nil {
+				t.Fatalf("CreateResponse: %v", err)
+			}
+			s, err := peer.NewSession()
+			if err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+			sessions = append(sessions, s)
+			ft.conn.put(t, response)
+			continue
+		}
+
+		for _, s := range sessions {
+			if packet, err := s.Open(nil, msg); err == nil {
+				if len(packet) != 0 {
+					t.Fatalf("first data message = %q, want a keepalive", packet)
+				}
+				return s
+			}
+		}
+		t.Fatal("forward sent a data message no response's session can open")
+	}
+}
+
+func TestForwardSendsInitiationAtStart(t *testing.T) {
+	local, peer := newHandshakePair(t)
+	// A long interval, so only the first initiation can arrive in time.
+	ft := startHandshakingForward(t, local, time.Hour)
+
+	msg := ft.conn.take(t)
+	checkInitiation(t, msg)
+	if err := peer.ConsumeInitiation(msg); err != nil {
+		t.Errorf("ConsumeInitiation: %v", err)
+	}
+}
+
+func TestForwardRetriesInitiation(t *testing.T) {
+	local, _ := newHandshakePair(t)
+	ft := startHandshakingForward(t, local, 20*time.Millisecond)
+
+	first, second := ft.conn.take(t), ft.conn.take(t)
+	checkInitiation(t, first)
+	checkInitiation(t, second)
+	if bytes.Equal(first, second) {
+		t.Error("forward sent the same initiation twice, want a new one each time")
+	}
+}
+
+// TestForwardStopsInitiatingWithSession checks that forward sends no more
+// initiations once a handshake has finished.
+func TestForwardStopsInitiatingWithSession(t *testing.T) {
+	const interval = 10 * time.Millisecond
+	local, peer := newHandshakePair(t)
+	ft := startHandshakingForward(t, local, interval)
+
+	completeHandshake(t, ft, peer)
+
+	// An initiation already being created when the session arrived can still
+	// be sent, so let it arrive and drop it before checking.
+	time.Sleep(5 * interval)
+	for len(ft.conn.out) > 0 {
+		<-ft.conn.out
+	}
+
+	select {
+	case msg := <-ft.conn.out:
+		t.Errorf("forward sent a %d-byte message of type %d after the handshake finished", len(msg), binary.LittleEndian.Uint32(msg))
+	case <-time.After(10 * interval):
 	}
 }

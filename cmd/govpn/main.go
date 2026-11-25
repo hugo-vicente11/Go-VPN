@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/hugo-vicente11/go-vpn/internal/identity"
 	"github.com/hugo-vicente11/go-vpn/internal/noise"
@@ -31,6 +33,10 @@ const (
 	tunnelMTU      = ethernetMTU - ipv6Size - udpOverhead - cryptoOverhead
 	udpPayloadSize = ethernetMTU - ipv6Size - udpOverhead
 )
+
+// handshakeRetryInterval is how long to wait for a handshake response before
+// sending a new initiation. It is REKEY_TIMEOUT in the whitepaper.
+const handshakeRetryInterval = 5 * time.Second
 
 func main() {
 	if len(os.Args) > 1 {
@@ -178,6 +184,7 @@ func run(port int, peer netip.AddrPort, addr netip.Prefix, privateKeyFile string
 
 	var pState peerState
 	pState.handshake = handshake
+	pState.retryInterval = handshakeRetryInterval
 	return forward(ctx, dev, t, &pState)
 }
 
@@ -325,6 +332,7 @@ type peerState struct {
 	mu             sync.Mutex
 	handshake      *noise.Handshake // nil means this peer does not handshake
 	sessionPointer atomic.Pointer[session.Session]
+	retryInterval  time.Duration // wait between initiations while there is no session
 }
 
 // answerInitiation consumes an initiation message as the responder and
@@ -352,6 +360,14 @@ func (p *peerState) answerInitiation(msg []byte) ([]byte, *session.Session, erro
 	return resp, s, nil
 }
 
+// startHandshake creates a new initiation message, as the initiator. It
+// holds mu because the receive loop uses the same handshake.
+func (p *peerState) startHandshake() ([]byte, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.handshake.CreateInitiation()
+}
+
 // finishHandshake consumes a response message as the initiator and returns
 // the new session. It returns an error if msg is not a valid response to the
 // initiation this side sent, or if this side sent none.
@@ -372,6 +388,16 @@ func (p *peerState) finishHandshake(msg []byte) (*session.Session, error) {
 	return s, nil
 }
 
+// retryDelay returns interval plus up to a third of it at random, so two
+// peers that start together do not keep sending initiations at the same time.
+func retryDelay(interval time.Duration) time.Duration {
+	if interval/3 <= 0 {
+		return interval
+	}
+
+	return interval + rand.N(interval/3)
+}
+
 // forward moves packets in both directions until ctx is cancelled: it reads
 // packets from dev, seals them with the current session and sends them on c,
 // and it receives messages from c, opens them with the current session and
@@ -388,6 +414,10 @@ func (p *peerState) finishHandshake(msg []byte) (*session.Session, error) {
 // the current one. Handshake messages are dropped if pState has no handshake
 // or if they are invalid, and any other type is dropped.
 //
+// If pState has a handshake, forward sends an initiation when it starts, and
+// again every pState.retryInterval, plus some jitter, while there is no
+// session.
+//
 // It returns nil when ctx is cancelled, and an error if the current session
 // can no longer seal, because its send counter is exhausted.
 func forward(ctx context.Context, dev device, c conn, pState *peerState) error {
@@ -399,6 +429,32 @@ func forward(ctx context.Context, dev device, c conn, pState *peerState) error {
 		dev.Close()
 		c.Close()
 	}()
+
+	if pState.handshake != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if pState.sessionPointer.Load() == nil {
+					msg, err := pState.startHandshake()
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error while creating handshake initiation: %v\n", err)
+					} else {
+						err = c.Send(msg)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "Error while sending handshake initiation: %v\n", err)
+						}
+					}
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(retryDelay(pState.retryInterval)):
+				}
+			}
+		}()
+	}
 
 	recvBuf := make([]byte, udpPayloadSize)
 	wg.Add(1)
