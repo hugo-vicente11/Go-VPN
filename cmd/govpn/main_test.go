@@ -926,3 +926,158 @@ func TestForwardStopsInitiatingWithSession(t *testing.T) {
 	case <-time.After(10 * interval):
 	}
 }
+
+// newOrderedHandshakePair is newHandshakePair with the keys in a known order:
+// local's public key is the greater one if localWins, so local wins a crossed
+// handshake.
+func newOrderedHandshakePair(t *testing.T, localWins bool) (local, peer *noise.Handshake) {
+	t.Helper()
+	a, b := newKey(t), newKey(t)
+	if (bytes.Compare(a.PublicKey().Bytes(), b.PublicKey().Bytes()) > 0) != localWins {
+		a, b = b, a
+	}
+	return noise.NewHandshake(a, b.PublicKey()), noise.NewHandshake(b, a.PublicKey())
+}
+
+// TestForwardCrossedHandshakeWinner checks that a peer waiting for the
+// response to its own initiation, with the greater public key, ignores the
+// peer's initiation and finishes its own handshake.
+func TestForwardCrossedHandshakeWinner(t *testing.T) {
+	local, peer := newOrderedHandshakePair(t, true)
+	ft := startHandshakingForward(t, local, time.Hour)
+	ownInitiation := ft.conn.take(t)
+
+	// The peer starts its own handshake at the same time.
+	peerInitiation, err := peer.CreateInitiation()
+	if err != nil {
+		t.Fatalf("CreateInitiation: %v", err)
+	}
+	ft.conn.put(t, peerInitiation)
+
+	// The peer loses, so it gives up its own and answers forward's.
+	if err := peer.ConsumeInitiation(ownInitiation); err != nil {
+		t.Fatalf("ConsumeInitiation: %v", err)
+	}
+	response, err := peer.CreateResponse()
+	if err != nil {
+		t.Fatalf("CreateResponse: %v", err)
+	}
+	s, err := peer.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	ft.conn.put(t, response)
+
+	// forward handles messages in order, so if it had answered the peer's
+	// initiation, that response would come before the keepalive.
+	msg := ft.conn.take(t)
+	if typ := binary.LittleEndian.Uint32(msg); typ != session.DataMessageType {
+		t.Fatalf("first message after the crossed initiation has type %d, want a keepalive", typ)
+	}
+	if got := openAll(t, s, msg); got[0] != "" {
+		t.Errorf("first data message = %q, want a keepalive", got[0])
+	}
+	checkTunnel(t, ft, s)
+}
+
+// TestForwardCrossedHandshakeLoser checks that a peer waiting for the response
+// to its own initiation, with the smaller public key, gives it up and answers
+// the peer's initiation.
+func TestForwardCrossedHandshakeLoser(t *testing.T) {
+	local, peer := newOrderedHandshakePair(t, false)
+	ft := startHandshakingForward(t, local, time.Hour)
+	checkInitiation(t, ft.conn.take(t))
+
+	peerInitiation, err := peer.CreateInitiation()
+	if err != nil {
+		t.Fatalf("CreateInitiation: %v", err)
+	}
+	ft.conn.put(t, peerInitiation)
+
+	if err := peer.ConsumeResponse(ft.conn.take(t)); err != nil {
+		t.Fatalf("ConsumeResponse(forward's response): %v", err)
+	}
+	s, err := peer.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	checkTunnel(t, ft, s)
+}
+
+// link delivers everything forward sends on a to b's conn, until the test
+// ends, as a network between two peers would.
+func link(t *testing.T, a, b *forwardTest) {
+	t.Helper()
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		for {
+			select {
+			case msg := <-a.conn.out:
+				select {
+				case b.conn.in <- msg:
+				case <-b.conn.done:
+				case <-done:
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+}
+
+// deliver puts packet on from's device until it comes out of to's device,
+// because packets are dropped until the handshake finishes.
+func deliver(t *testing.T, from, to *forwardTest, packet string) {
+	t.Helper()
+	deadline := time.After(testTimeout)
+	for {
+		from.dev.put(t, []byte(packet))
+		select {
+		case got := <-to.dev.out:
+			if string(got) != packet {
+				t.Fatalf("device got %q, want %q", got, packet)
+			}
+			return
+		case <-time.After(20 * time.Millisecond):
+		case <-deadline:
+			t.Fatalf("%q was not delivered in time", packet)
+		}
+	}
+}
+
+// TestForwardTwoPeers runs two forwards linked to each other, as two govpn
+// started at the same time. Both send an initiation at once, so their
+// handshakes usually cross, and packets must still get through both ways.
+func TestForwardTwoPeers(t *testing.T) {
+	ha, hb := newHandshakePair(t)
+	// A long interval, so the first initiations are the only ones: a retry
+	// cannot hide a crossed handshake that went wrong.
+	a := launchForward(t, &peerState{handshake: ha, retryInterval: time.Hour}, nil)
+	b := launchForward(t, &peerState{handshake: hb, retryInterval: time.Hour}, nil)
+	link(t, a, b)
+	link(t, b, a)
+
+	deliver(t, a, b, "from a")
+	deliver(t, b, a, "from b")
+}
+
+// TestForwardWinnerAnswersWhenNotInitiating checks that the tie rule applies
+// only to crossed handshakes: a peer with the greater public key that is not
+// waiting for its own response still answers the peer's initiation.
+func TestForwardWinnerAnswersWhenNotInitiating(t *testing.T) {
+	local, peer := newOrderedHandshakePair(t, true)
+	// A session is already in place, so forward sends no initiation of its own.
+	ft := startForwardWith(t, local)
+
+	initiation, err := peer.CreateInitiation()
+	if err != nil {
+		t.Fatalf("CreateInitiation: %v", err)
+	}
+	ft.conn.put(t, initiation)
+
+	if err := peer.ConsumeResponse(ft.conn.take(t)); err != nil {
+		t.Fatalf("ConsumeResponse(forward's response): %v", err)
+	}
+}

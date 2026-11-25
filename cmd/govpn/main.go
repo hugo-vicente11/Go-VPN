@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -33,6 +34,10 @@ const (
 	tunnelMTU      = ethernetMTU - ipv6Size - udpOverhead - cryptoOverhead
 	udpPayloadSize = ethernetMTU - ipv6Size - udpOverhead
 )
+
+// errCrossedHandshake means both peers started a handshake at the same time
+// and this peer keeps its own, so it does not answer the peer's initiation.
+var errCrossedHandshake = errors.New("both peers started a handshake; ignoring the peer's, this peer's goes ahead")
 
 // handshakeRetryInterval is how long to wait for a handshake response before
 // sending a new initiation. It is REKEY_TIMEOUT in the whitepaper.
@@ -335,12 +340,30 @@ type peerState struct {
 	retryInterval  time.Duration // wait between initiations while there is no session
 }
 
+// winsCrossedHandshake reports whether this peer keeps its own initiation
+// when both peers start a handshake at the same time: it does when its public
+// key is the greater one. Both peers compare the same two keys, so exactly
+// one of them wins.
+func (p *peerState) winsCrossedHandshake() bool {
+	return bytes.Compare(p.handshake.LocalPublicKey().Bytes(), p.handshake.PeerPublicKey().Bytes()) > 0
+}
+
 // answerInitiation consumes an initiation message as the responder and
 // returns the response to send and the new session. It returns an error if
 // msg is not a valid initiation, and then the handshake is left as it was.
+// It returns errCrossedHandshake if this peer is waiting for the response to
+// its own initiation and wins the tie (see winsCrossedHandshake).
 func (p *peerState) answerInitiation(msg []byte) ([]byte, *session.Session, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Both peers started a handshake. The winner keeps its own initiation and
+	// ignores the peer's; the other gives up its own and answers. Otherwise
+	// each would answer the other and lose its own initiation, and the two
+	// would end with different sessions.
+	if p.handshake.Initiating() && p.winsCrossedHandshake() {
+		return nil, nil, errCrossedHandshake
+	}
 
 	err := p.handshake.ConsumeInitiation(msg)
 	if err != nil {

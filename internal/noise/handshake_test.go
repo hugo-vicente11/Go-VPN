@@ -909,3 +909,50 @@ func TestCreateReturnsNilOnError(t *testing.T) {
 		t.Errorf("CreateResponse returned %d bytes with an error, want nil", len(b))
 	}
 }
+
+// TestInitiating checks that Initiating is true only while this side waits
+// for the response to its initiation.
+func TestInitiating(t *testing.T) {
+	alice, bob := initiatorHandshake(t), responderHandshake(t)
+	if alice.Initiating() {
+		t.Error("Initiating = true before any initiation")
+	}
+
+	initiation, err := alice.CreateInitiation()
+	if err != nil {
+		t.Fatalf("CreateInitiation: %v", err)
+	}
+	if !alice.Initiating() {
+		t.Error("Initiating = false after CreateInitiation")
+	}
+
+	if err := bob.ConsumeInitiation(initiation); err != nil {
+		t.Fatalf("ConsumeInitiation: %v", err)
+	}
+	if bob.Initiating() {
+		t.Error("the responder's Initiating = true")
+	}
+	response, err := bob.CreateResponse()
+	if err != nil {
+		t.Fatalf("CreateResponse: %v", err)
+	}
+	if err := alice.ConsumeResponse(response); err != nil {
+		t.Fatalf("ConsumeResponse: %v", err)
+	}
+	if alice.Initiating() {
+		t.Error("Initiating = true after ConsumeResponse")
+	}
+}
+
+func TestHandshakePublicKeys(t *testing.T) {
+	alice := initiatorHandshake(t)
+	wantLocal := privateKey(t, alicePrivate).PublicKey().String()
+	wantPeer := privateKey(t, bobPrivate).PublicKey().String()
+
+	if got := alice.LocalPublicKey().String(); got != wantLocal {
+		t.Errorf("LocalPublicKey = %s, want %s", got, wantLocal)
+	}
+	if got := alice.PeerPublicKey().String(); got != wantPeer {
+		t.Errorf("PeerPublicKey = %s, want %s", got, wantPeer)
+	}
+}

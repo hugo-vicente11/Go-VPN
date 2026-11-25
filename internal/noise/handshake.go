@@ -29,6 +29,7 @@ import (
 // continues from it.
 type Handshake struct {
 	localStatic   *identity.PrivateKey // this peer's identity
+	localPublic   *identity.PublicKey  // localStatic's public key, computed once
 	remoteStatic  *identity.PublicKey  // the peer's identity, known in advance
 	lastTimestamp [12]byte             // newest TAI64N accepted from the peer
 	presharedKey  [32]byte             // Q in the whitepaper, zero without a PSK
@@ -87,7 +88,7 @@ var (
 // NewHandshake returns a handshake between localStatic, this peer's private
 // key, and remoteStatic, the peer's public key. No message is created yet.
 func NewHandshake(localStatic *identity.PrivateKey, remoteStatic *identity.PublicKey) *Handshake {
-	return &Handshake{localStatic: localStatic, remoteStatic: remoteStatic}
+	return &Handshake{localStatic: localStatic, remoteStatic: remoteStatic, localPublic: localStatic.PublicKey()}
 }
 
 // createInitiationWith creates the initiation message, the first message of
@@ -141,6 +142,23 @@ func (h *Handshake) createInitiationWith(ephemeral *identity.PrivateKey, now tim
 	h.stage = initiationCreatedStage
 
 	return b, nil
+}
+
+// LocalPublicKey returns this peer's static public key.
+func (h *Handshake) LocalPublicKey() *identity.PublicKey {
+	return h.localPublic
+}
+
+// PeerPublicKey returns the peer's static public key, the one this handshake
+// was created with.
+func (h *Handshake) PeerPublicKey() *identity.PublicKey {
+	return h.remoteStatic
+}
+
+// Initiating reports whether this side sent an initiation and is waiting
+// for its response.
+func (h *Handshake) Initiating() bool {
+	return h.stage == initiationCreatedStage
 }
 
 // CreateInitiation creates the initiation message with a new random ephemeral
