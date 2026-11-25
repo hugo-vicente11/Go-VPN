@@ -2,6 +2,10 @@
 
 set -eu
 
+private_key_file="${PRIVATE_KEY_FILE:-/run/secrets/private_key}"
+peer_public_key_file="${PEER_PUBLIC_KEY_FILE:-/peer_public_key}"
+peer_public_key=$(cat "$peer_public_key_file")
+
 : "${TUN_IP:?tun IP address not given as environment variable}"
 : "${REMOTE_NET:?route not given as environment variable}"
 (
@@ -25,4 +29,4 @@ set -eu
     echo "Route to $REMOTE_NET via $iface added"
 ) &
 
-exec ./bin/govpn -address "$TUN_IP" -key-file "${KEY_FILE:-/run/secrets/govpn_key}" "$@"
+exec ./bin/govpn -address "$TUN_IP" -private-key-file "$private_key_file" -peer-public-key "$peer_public_key" "$@"

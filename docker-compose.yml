@@ -1,6 +1,14 @@
 secrets:
-  govpn_key:
-    file: ./govpn.key
+  govpn_a_key:
+    file: ./govpn-a.key
+  govpn_b_key:
+    file: ./govpn-b.key
+
+configs:
+  govpn_a_pub:
+    file: ./govpn-a.pub
+  govpn_b_pub:
+    file: ./govpn-b.pub
 
 services:
   govpn-a:
@@ -20,11 +28,16 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
-    command: ["-peer", "172.30.0.3:9000", "-initiator"]
+    command: ["-peer", "172.30.0.3:9000"]
     networks:
       vpn_net:
         ipv4_address: 172.30.0.2
-    secrets: [govpn_key]
+    secrets:
+      - source: govpn_a_key
+        target: private_key
+    configs:
+      - source: govpn_b_pub
+        target: /peer_public_key
 
   govpn-b:
     build: .
@@ -47,7 +60,12 @@ services:
     networks:
       vpn_net:
         ipv4_address: 172.30.0.3
-    secrets: [govpn_key]
+    secrets:
+      - source: govpn_b_key
+        target: private_key
+    configs:
+      - source: govpn_a_pub
+        target: /peer_public_key
 
 networks:
   vpn_net:
