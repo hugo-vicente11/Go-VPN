@@ -2,14 +2,9 @@ package session
 
 import (
 	"crypto/cipher"
-	"crypto/hkdf"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"math"
-	"strings"
 	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -150,67 +145,4 @@ func (s *Session) Open(dst, msg []byte) ([]byte, error) {
 	}
 
 	return res, nil
-}
-
-// ParseKey decodes a key in standard base64 with padding, the format
-// produced by wg genkey. Surrounding whitespace, such as a trailing newline
-// from a key file, is ignored. It returns an error if s is not valid base64
-// or does not decode to exactly chacha20poly1305.KeySize bytes.
-func ParseKey(s string) (Key, error) {
-	s = strings.TrimSpace(s)
-	key, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return Key{}, fmt.Errorf("session: key is not valid base64: %w", err)
-	}
-
-	if len(key) != chacha20poly1305.KeySize {
-		return Key{}, fmt.Errorf("session: invalid key length: expected %d bytes, got %d", chacha20poly1305.KeySize, len(key))
-	}
-
-	var res Key
-	copy(res[:], key)
-
-	return res, nil
-}
-
-// HKDF info labels, one for each direction of the tunnel. They name the
-// protocol, its version, and the direction, so each label gives a different
-// key. Both peers must use the same labels, or they derive different keys.
-const (
-	infoInitiatorToResponder = "govpn v1 initiator to responder"
-	infoResponderToInitiator = "govpn v1 responder to initiator"
-)
-
-// deriveKey derives a key from shared with HKDF-SHA256, using info as the label.
-func deriveKey(shared Key, info string) (Key, error) {
-	key, err := hkdf.Key(sha256.New, shared[:], nil, info, chacha20poly1305.KeySize)
-	if err != nil {
-		return Key{}, fmt.Errorf("hkdf: %w", err)
-	}
-	return Key(key), nil
-}
-
-// DeriveKeys derives one key for each direction of a tunnel from shared, and
-// returns the keys this peer seals and opens with, ready to pass to New.
-// Exactly one of the two peers must set initiator. If both or neither do,
-// both peers seal with the same key and cannot open each other's messages.
-//
-// DeriveKeys is temporary: a handshake will replace it. The keys depend only
-// on shared, so a restarted peer derives the same send key, starts its
-// counter at 0 again, and reuses nonces.
-func DeriveKeys(shared Key, initiator bool) (send, recv Key, err error) {
-	i2r, err := deriveKey(shared, infoInitiatorToResponder)
-	if err != nil {
-		return Key{}, Key{}, fmt.Errorf("session: deriving initiator to responder key: %w", err)
-	}
-
-	r2i, err := deriveKey(shared, infoResponderToInitiator)
-	if err != nil {
-		return Key{}, Key{}, fmt.Errorf("session: deriving responder to initiator key: %w", err)
-	}
-
-	if initiator {
-		return i2r, r2i, nil
-	}
-	return r2i, i2r, nil
 }

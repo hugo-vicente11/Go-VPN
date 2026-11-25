@@ -2,11 +2,8 @@ package session
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,10 +21,6 @@ var (
 	// aliceIndex and bobIndex are the indices of the two ends of a tunnel.
 	aliceIndex uint32 = 0x0a0b0c0d
 	bobIndex   uint32 = 0x05060708
-
-	// testKeyB64 is a key in the format wg genkey produces, written by hand.
-	// It decodes to the bytes 0 to 31 (see testKeyB64Bytes), not to testKey.
-	testKeyB64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 )
 
 // newTestSession returns a Session that uses key and testIndex in both
@@ -384,133 +377,4 @@ func checkSessionPair(t *testing.T, a, b *Session) {
 			t.Error("both directions produced the same ciphertext for the same counter and packet")
 		}
 	})
-}
-
-// deriveKeys calls DeriveKeys, failing the test on error.
-func deriveKeys(t *testing.T, shared Key, initiator bool) (send, recv Key) {
-	t.Helper()
-	send, recv, err := DeriveKeys(shared, initiator)
-	if err != nil {
-		t.Fatalf("DeriveKeys(initiator=%v): %v", initiator, err)
-	}
-	return send, recv
-}
-
-func TestDeriveKeys(t *testing.T) {
-	iSend, iRecv := deriveKeys(t, testKey, true)
-	rSend, rRecv := deriveKeys(t, testKey, false)
-
-	if iSend != rRecv {
-		t.Errorf("initiator send key %x != responder receive key %x", iSend, rRecv)
-	}
-	if iRecv != rSend {
-		t.Errorf("initiator receive key %x != responder send key %x", iRecv, rSend)
-	}
-	if iSend == iRecv {
-		t.Errorf("send and receive keys are both %x, want one key for each direction", iSend)
-	}
-	for _, k := range []Key{iSend, iRecv} {
-		if k == testKey {
-			t.Errorf("derived key %x is the shared key", k)
-		}
-	}
-
-	otherSend, otherRecv := deriveKeys(t, otherKey, true)
-	if otherSend == iSend || otherRecv == iRecv {
-		t.Error("different shared keys derived the same keys")
-	}
-}
-
-// TestDeriveKeysKnownAnswer checks DeriveKeys against keys computed outside
-// Go, with HKDF-SHA256 written by hand from RFC 5869. The other tests only
-// compare derived keys with each other, so they cannot catch a change that
-// alters both directions, such as a new hash, salt, or label. Peers running
-// different versions would then derive different keys.
-func TestDeriveKeysKnownAnswer(t *testing.T) {
-	want := map[bool]struct{ send, recv string }{
-		true: {
-			send: "3b38df6ff2f8a6119c1d913318e8ad091da1097d89814a42f279ff2e45f4cba0",
-			recv: "febd29c9d4f4ffb13f6b1d2bff5b1ef67c27e298a07d0511add117eb7fc05b22",
-		},
-		false: {
-			send: "febd29c9d4f4ffb13f6b1d2bff5b1ef67c27e298a07d0511add117eb7fc05b22",
-			recv: "3b38df6ff2f8a6119c1d913318e8ad091da1097d89814a42f279ff2e45f4cba0",
-		},
-	}
-
-	for _, initiator := range []bool{true, false} {
-		send, recv := deriveKeys(t, testKeyB64Bytes(), initiator)
-		if got := hex.EncodeToString(send[:]); got != want[initiator].send {
-			t.Errorf("DeriveKeys(initiator=%v) send = %s, want %s", initiator, got, want[initiator].send)
-		}
-		if got := hex.EncodeToString(recv[:]); got != want[initiator].recv {
-			t.Errorf("DeriveKeys(initiator=%v) recv = %s, want %s", initiator, got, want[initiator].recv)
-		}
-	}
-}
-
-// TestDerivedSessionPair checks that Sessions built from DeriveKeys work as
-// the two ends of a tunnel.
-func TestDerivedSessionPair(t *testing.T) {
-	iSend, iRecv := deriveKeys(t, testKey, true)
-	rSend, rRecv := deriveKeys(t, testKey, false)
-
-	checkSessionPair(t,
-		newSession(t, iSend, iRecv, bobIndex, aliceIndex),
-		newSession(t, rSend, rRecv, aliceIndex, bobIndex))
-}
-
-// testKeyB64Bytes returns the key that testKeyB64 encodes: the bytes 0 to 31.
-func testKeyB64Bytes() Key {
-	var key Key
-	for i := range key {
-		key[i] = byte(i)
-	}
-	return key
-}
-
-func TestParseKey(t *testing.T) {
-	want := testKeyB64Bytes()
-
-	tests := []struct {
-		name    string
-		input   string
-		wantErr bool
-	}{
-		{"valid", testKeyB64, false},
-		{"trailing newline", testKeyB64 + "\n", false},
-		{"surrounding whitespace", "  " + testKeyB64 + "\t", false},
-		{"invalid base64", "not base64!", true},
-		{"missing padding", strings.TrimSuffix(testKeyB64, "="), true},
-		{"too short", base64.StdEncoding.EncodeToString(make([]byte, 16)), true},
-		{"too long", base64.StdEncoding.EncodeToString(make([]byte, 33)), true},
-		{"empty", "", true},
-		{"only whitespace", "\n", true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := ParseKey(tc.input)
-			if gotErr := err != nil; gotErr != tc.wantErr {
-				t.Fatalf("ParseKey(%q) error = %v, wantErr %v", tc.input, err, tc.wantErr)
-			}
-			if !tc.wantErr && got != want {
-				t.Errorf("ParseKey(%q) = %x, want %x", tc.input, got, want)
-			}
-		})
-	}
-}
-
-// TestParseKeyErrorContext checks that ParseKey's errors say they come from
-// this package, so a user can tell a bad key file from other failures.
-func TestParseKeyErrorContext(t *testing.T) {
-	for _, input := range []string{"not base64!", ""} {
-		_, err := ParseKey(input)
-		if err == nil {
-			t.Fatalf("ParseKey(%q) returned nil error, want an error", input)
-		}
-		if msg := err.Error(); !strings.HasPrefix(msg, "session: ") {
-			t.Errorf("ParseKey(%q) error = %q, want it to start with %q", input, msg, "session: ")
-		}
-	}
 }
