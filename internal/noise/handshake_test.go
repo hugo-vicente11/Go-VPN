@@ -2,12 +2,14 @@ package noise
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/hugo-vicente11/go-vpn/internal/identity"
+	"github.com/hugo-vicente11/go-vpn/internal/session"
 )
 
 // Fixed keys for the handshake tests: Alice and Bob from RFC 7748, section
@@ -36,15 +38,15 @@ func privateKey(t *testing.T, s string) *identity.PrivateKey {
 }
 
 // initiatorHandshake returns Alice's side of a handshake with Bob.
-func initiatorHandshake(t *testing.T) *handshake {
+func initiatorHandshake(t *testing.T) *Handshake {
 	t.Helper()
 	bob := privateKey(t, bobPrivate).PublicKey()
-	return newHandshake(privateKey(t, alicePrivate), bob)
+	return NewHandshake(privateKey(t, alicePrivate), bob)
 }
 
 // createTestInitiation creates an initiation message with the fixed ephemeral
 // key, index and time.
-func createTestInitiation(t *testing.T, h *handshake) [initiationSize]byte {
+func createTestInitiation(t *testing.T, h *Handshake) [initiationSize]byte {
 	t.Helper()
 	b, err := h.createInitiationWith(privateKey(t, ephemeralPrivate), testTime, testIndex)
 	if err != nil {
@@ -158,7 +160,7 @@ func TestCreateInitiationRejectsLowOrderKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPublicKey: %v", err)
 	}
-	h := newHandshake(privateKey(t, alicePrivate), zero)
+	h := NewHandshake(privateKey(t, alicePrivate), zero)
 
 	if _, err := h.createInitiationWith(privateKey(t, ephemeralPrivate), testTime, testIndex); err == nil {
 		t.Fatal("createInitiationWith accepted an all-zero responder key")
@@ -173,20 +175,23 @@ func TestCreateInitiationRejectsLowOrderKey(t *testing.T) {
 func TestCreateInitiation(t *testing.T) {
 	h := initiatorHandshake(t)
 
-	first, err := h.createInitiation()
+	first, err := h.CreateInitiation()
 	if err != nil {
-		t.Fatalf("createInitiation: %v", err)
+		t.Fatalf("CreateInitiation: %v", err)
 	}
 	if err := verifyMAC1(first[:], initiationMAC1Offset, mac1Key(h.remoteStatic)); err != nil {
 		t.Errorf("verifyMAC1: %v", err)
 	}
 	firstEphemeral := h.localEphemeral.PublicKey().Bytes()
 
-	second, err := h.createInitiation()
+	second, err := h.CreateInitiation()
 	if err != nil {
-		t.Fatalf("createInitiation: %v", err)
+		t.Fatalf("CreateInitiation: %v", err)
 	}
-	if second == first {
+	if len(first) != initiationSize {
+		t.Errorf("len = %d, want %d", len(first), initiationSize)
+	}
+	if bytes.Equal(second, first) {
 		t.Error("two calls gave the same message")
 	}
 	if bytes.Equal(h.localEphemeral.PublicKey().Bytes(), firstEphemeral) {
@@ -195,10 +200,10 @@ func TestCreateInitiation(t *testing.T) {
 }
 
 // responderHandshake returns Bob's side of a handshake with Alice.
-func responderHandshake(t *testing.T) *handshake {
+func responderHandshake(t *testing.T) *Handshake {
 	t.Helper()
 	alice := privateKey(t, alicePrivate).PublicKey()
-	return newHandshake(privateKey(t, bobPrivate), alice)
+	return NewHandshake(privateKey(t, bobPrivate), alice)
 }
 
 // TestConsumeInitiation checks that Bob accepts Alice's message and ends in
@@ -207,8 +212,8 @@ func TestConsumeInitiation(t *testing.T) {
 	alice, bob := initiatorHandshake(t), responderHandshake(t)
 	b := createTestInitiation(t, alice)
 
-	if err := bob.consumeInitiation(b[:]); err != nil {
-		t.Fatalf("consumeInitiation: %v", err)
+	if err := bob.ConsumeInitiation(b[:]); err != nil {
+		t.Fatalf("ConsumeInitiation: %v", err)
 	}
 
 	if *bob.state != *alice.state {
@@ -236,7 +241,7 @@ func TestConsumeInitiationNewerTimestamp(t *testing.T) {
 		if err != nil {
 			t.Fatalf("createInitiationWith: %v", err)
 		}
-		if err := bob.consumeInitiation(b[:]); err != nil {
+		if err := bob.ConsumeInitiation(b[:]); err != nil {
 			t.Fatalf("message %d: consumeInitiation: %v", i, err)
 		}
 	}
@@ -263,10 +268,10 @@ func TestConsumeInitiationRejects(t *testing.T) {
 	valid := createTestInitiation(t, initiatorHandshake(t))
 
 	// forAnotherResponder is Alice's message to Charlie instead of Bob.
-	forAnotherResponder := createTestInitiation(t, newHandshake(privateKey(t, alicePrivate), charlie.PublicKey()))
+	forAnotherResponder := createTestInitiation(t, NewHandshake(privateKey(t, alicePrivate), charlie.PublicKey()))
 	// fromUnknownPeer is Charlie's message to Bob: Charlie knows Bob's key,
 	// but Bob expects Alice.
-	fromUnknownPeer := createTestInitiation(t, newHandshake(charlie, bobPublic))
+	fromUnknownPeer := createTestInitiation(t, NewHandshake(charlie, bobPublic))
 
 	// older is Alice's message from a second before testTime.
 	older, err := initiatorHandshake(t).createInitiationWith(privateKey(t, ephemeralPrivate), testTime.Add(-time.Second), testIndex)
@@ -297,14 +302,14 @@ func TestConsumeInitiationRejects(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			bob := responderHandshake(t)
 			if tc.first != nil {
-				if err := bob.consumeInitiation(tc.first); err != nil {
+				if err := bob.ConsumeInitiation(tc.first); err != nil {
 					t.Fatalf("consuming the first message: %v", err)
 				}
 			}
 			before := *bob
 
-			if err := bob.consumeInitiation(tc.b); !errors.Is(err, tc.wantErr) {
-				t.Fatalf("consumeInitiation error = %v, want %v", err, tc.wantErr)
+			if err := bob.ConsumeInitiation(tc.b); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("ConsumeInitiation error = %v, want %v", err, tc.wantErr)
 			}
 			if *bob != before {
 				t.Error("a rejected message changed the handshake")
@@ -319,11 +324,11 @@ func TestConsumeInitiationAfterRejection(t *testing.T) {
 	bob := responderHandshake(t)
 	valid := createTestInitiation(t, initiatorHandshake(t))
 
-	if err := bob.consumeInitiation(resign(t, valid, 88)); err == nil {
-		t.Fatal("consumeInitiation accepted a changed timestamp")
+	if err := bob.ConsumeInitiation(resign(t, valid, 88)); err == nil {
+		t.Fatal("ConsumeInitiation accepted a changed timestamp")
 	}
-	if err := bob.consumeInitiation(valid[:]); err != nil {
-		t.Errorf("consumeInitiation of the real message after a forged one: %v", err)
+	if err := bob.ConsumeInitiation(valid[:]); err != nil {
+		t.Errorf("ConsumeInitiation of the real message after a forged one: %v", err)
 	}
 }
 
@@ -335,8 +340,8 @@ func TestConsumeInitiationIndexIsNotEncrypted(t *testing.T) {
 	bob := responderHandshake(t)
 	valid := createTestInitiation(t, initiatorHandshake(t))
 
-	if err := bob.consumeInitiation(resign(t, valid, 4)); err != nil {
-		t.Fatalf("consumeInitiation: %v", err)
+	if err := bob.ConsumeInitiation(resign(t, valid, 4)); err != nil {
+		t.Fatalf("ConsumeInitiation: %v", err)
 	}
 	if bob.remoteIndex == testIndex {
 		t.Error("remoteIndex is the original index, want the changed one")
@@ -352,19 +357,19 @@ const (
 
 // bobAfterInitiation returns Alice's and Bob's handshakes after Bob accepted
 // Alice's initiation message, ready for Bob to respond.
-func bobAfterInitiation(t *testing.T) (alice, bob *handshake) {
+func bobAfterInitiation(t *testing.T) (alice, bob *Handshake) {
 	t.Helper()
 	alice, bob = initiatorHandshake(t), responderHandshake(t)
 	b := createTestInitiation(t, alice)
-	if err := bob.consumeInitiation(b[:]); err != nil {
-		t.Fatalf("consumeInitiation: %v", err)
+	if err := bob.ConsumeInitiation(b[:]); err != nil {
+		t.Fatalf("ConsumeInitiation: %v", err)
 	}
 	return alice, bob
 }
 
 // createTestResponse creates a response with Bob's fixed ephemeral key and
 // index.
-func createTestResponse(t *testing.T, bob *handshake) [responseSize]byte {
+func createTestResponse(t *testing.T, bob *Handshake) [responseSize]byte {
 	t.Helper()
 	b, err := bob.createResponseWith(privateKey(t, responderEphemeral), responderIndex)
 	if err != nil {
@@ -459,18 +464,29 @@ func TestCreateResponseIsDeterministic(t *testing.T) {
 }
 
 // TestCreateResponseWithoutInitiation checks that a response needs an
-// accepted initiation, including on a handshake that only created one, and
-// that the handshake is left unchanged.
+// initiation accepted as the last step, and that the handshake is left
+// unchanged otherwise: not on a handshake that only created one, nor one
+// that already answered it, nor an initiator that finished.
 func TestCreateResponseWithoutInitiation(t *testing.T) {
 	onlyCreated := initiatorHandshake(t)
 	createTestInitiation(t, onlyCreated)
 
+	_, answered := bobAfterInitiation(t)
+	createTestResponse(t, answered)
+
+	finished, _, response := aliceAfterResponse(t)
+	if err := finished.ConsumeResponse(response[:]); err != nil {
+		t.Fatalf("ConsumeResponse: %v", err)
+	}
+
 	tests := []struct {
 		name string
-		h    *handshake
+		h    *Handshake
 	}{
 		{"new handshake", responderHandshake(t)},
 		{"after creating an initiation", onlyCreated},
+		{"after creating a response", answered},
+		{"initiator after consuming the response", finished},
 	}
 
 	for _, tc := range tests {
@@ -491,20 +507,23 @@ func TestCreateResponseWithoutInitiation(t *testing.T) {
 // valid, and two calls give different ephemeral keys and indices.
 func TestCreateResponse(t *testing.T) {
 	alice, bob := bobAfterInitiation(t)
-	first, err := bob.createResponse()
+	first, err := bob.CreateResponse()
 	if err != nil {
-		t.Fatalf("createResponse: %v", err)
+		t.Fatalf("CreateResponse: %v", err)
 	}
 	if err := verifyMAC1(first[:], responseMAC1Offset, mac1Key(alice.localStatic.PublicKey())); err != nil {
 		t.Errorf("verifyMAC1: %v", err)
 	}
 
 	_, bob2 := bobAfterInitiation(t)
-	second, err := bob2.createResponse()
+	second, err := bob2.CreateResponse()
 	if err != nil {
-		t.Fatalf("createResponse: %v", err)
+		t.Fatalf("CreateResponse: %v", err)
 	}
-	if second == first {
+	if len(first) != responseSize {
+		t.Errorf("len = %d, want %d", len(first), responseSize)
+	}
+	if bytes.Equal(second, first) {
 		t.Error("two calls gave the same response")
 	}
 	if bytes.Equal(bob.localEphemeral.PublicKey().Bytes(), bob2.localEphemeral.PublicKey().Bytes()) {
@@ -514,7 +533,7 @@ func TestCreateResponse(t *testing.T) {
 
 // aliceAfterResponse returns Alice's and Bob's handshakes after Bob created
 // his response, and the response, ready for Alice to consume it.
-func aliceAfterResponse(t *testing.T) (alice, bob *handshake, response [responseSize]byte) {
+func aliceAfterResponse(t *testing.T) (alice, bob *Handshake, response [responseSize]byte) {
 	t.Helper()
 	alice, bob = bobAfterInitiation(t)
 	response = createTestResponse(t, bob)
@@ -526,8 +545,8 @@ func aliceAfterResponse(t *testing.T) (alice, bob *handshake, response [response
 func TestConsumeResponse(t *testing.T) {
 	alice, bob, b := aliceAfterResponse(t)
 
-	if err := alice.consumeResponse(b[:]); err != nil {
-		t.Fatalf("consumeResponse: %v", err)
+	if err := alice.ConsumeResponse(b[:]); err != nil {
+		t.Fatalf("ConsumeResponse: %v", err)
 	}
 
 	if *alice.state != *bob.state {
@@ -583,22 +602,22 @@ func TestConsumeResponseRejects(t *testing.T) {
 		{"changed ephemeral", nil, resignResponse(t, valid, 12), errDecrypt},
 		{"changed encrypted nothing", nil, resignResponse(t, valid, 44), errDecrypt},
 		{"other preshared key", nil, otherPSK[:], errDecrypt},
-		{"replayed", valid[:], valid[:], errDecrypt},
+		{"replayed", valid[:], valid[:], errNoInitiationCreated},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			alice, _, _ := aliceAfterResponse(t)
 			if tc.first != nil {
-				if err := alice.consumeResponse(tc.first); err != nil {
+				if err := alice.ConsumeResponse(tc.first); err != nil {
 					t.Fatalf("consuming the first message: %v", err)
 				}
 			}
 			before := *alice
 			stateBefore := *alice.state
 
-			if err := alice.consumeResponse(tc.b); !errors.Is(err, tc.wantErr) {
-				t.Fatalf("consumeResponse error = %v, want %v", err, tc.wantErr)
+			if err := alice.ConsumeResponse(tc.b); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("ConsumeResponse error = %v, want %v", err, tc.wantErr)
 			}
 			if *alice != before || *alice.state != stateBefore {
 				t.Error("a rejected message changed the handshake")
@@ -615,8 +634,8 @@ func TestConsumeResponseWithoutInitiation(t *testing.T) {
 	h := initiatorHandshake(t)
 	before := *h
 
-	if err := h.consumeResponse(b[:]); !errors.Is(err, errNoInitiationCreated) {
-		t.Fatalf("consumeResponse error = %v, want %v", err, errNoInitiationCreated)
+	if err := h.ConsumeResponse(b[:]); !errors.Is(err, errNoInitiationCreated) {
+		t.Fatalf("ConsumeResponse error = %v, want %v", err, errNoInitiationCreated)
 	}
 	if *h != before {
 		t.Error("a rejected message changed the handshake")
@@ -628,11 +647,11 @@ func TestConsumeResponseWithoutInitiation(t *testing.T) {
 func TestConsumeResponseAfterRejection(t *testing.T) {
 	alice, _, valid := aliceAfterResponse(t)
 
-	if err := alice.consumeResponse(resignResponse(t, valid, 44)); err == nil {
-		t.Fatal("consumeResponse accepted a changed encrypted nothing")
+	if err := alice.ConsumeResponse(resignResponse(t, valid, 44)); err == nil {
+		t.Fatal("ConsumeResponse accepted a changed encrypted nothing")
 	}
-	if err := alice.consumeResponse(valid[:]); err != nil {
-		t.Errorf("consumeResponse of the real message after a forged one: %v", err)
+	if err := alice.ConsumeResponse(valid[:]); err != nil {
+		t.Errorf("ConsumeResponse of the real message after a forged one: %v", err)
 	}
 }
 
@@ -642,19 +661,19 @@ func TestConsumeResponseAfterRejection(t *testing.T) {
 func TestHandshake(t *testing.T) {
 	alice, bob := initiatorHandshake(t), responderHandshake(t)
 
-	initiation, err := alice.createInitiation()
+	initiation, err := alice.CreateInitiation()
 	if err != nil {
-		t.Fatalf("createInitiation: %v", err)
+		t.Fatalf("CreateInitiation: %v", err)
 	}
-	if err := bob.consumeInitiation(initiation[:]); err != nil {
-		t.Fatalf("consumeInitiation: %v", err)
+	if err := bob.ConsumeInitiation(initiation[:]); err != nil {
+		t.Fatalf("ConsumeInitiation: %v", err)
 	}
-	response, err := bob.createResponse()
+	response, err := bob.CreateResponse()
 	if err != nil {
-		t.Fatalf("createResponse: %v", err)
+		t.Fatalf("CreateResponse: %v", err)
 	}
-	if err := alice.consumeResponse(response[:]); err != nil {
-		t.Fatalf("consumeResponse: %v", err)
+	if err := alice.ConsumeResponse(response[:]); err != nil {
+		t.Fatalf("ConsumeResponse: %v", err)
 	}
 
 	if alice.remoteIndex != bob.localIndex || bob.remoteIndex != alice.localIndex {
@@ -693,16 +712,16 @@ func TestHandshakeKnownAnswer(t *testing.T) {
 	if got := hex.EncodeToString(initiation[:]); got != wantInitiation {
 		t.Fatalf("initiation:\n got %s\nwant %s", got, wantInitiation)
 	}
-	if err := bob.consumeInitiation(initiation[:]); err != nil {
-		t.Fatalf("consumeInitiation: %v", err)
+	if err := bob.ConsumeInitiation(initiation[:]); err != nil {
+		t.Fatalf("ConsumeInitiation: %v", err)
 	}
 
 	response := createTestResponse(t, bob)
 	if got := hex.EncodeToString(response[:]); got != wantResponse {
 		t.Fatalf("response:\n got %s\nwant %s", got, wantResponse)
 	}
-	if err := alice.consumeResponse(response[:]); err != nil {
-		t.Fatalf("consumeResponse: %v", err)
+	if err := alice.ConsumeResponse(response[:]); err != nil {
+		t.Fatalf("ConsumeResponse: %v", err)
 	}
 
 	initiatorToResponder, responderToInitiator := alice.state.deriveTransportKeys()
@@ -711,5 +730,229 @@ func TestHandshakeKnownAnswer(t *testing.T) {
 	}
 	if got := hex.EncodeToString(responderToInitiator[:]); got != wantResponderToInitiator {
 		t.Errorf("responderToInitiator = %s, want %s", got, wantResponderToInitiator)
+	}
+}
+
+// finishedHandshake returns Alice's and Bob's handshakes after the whole
+// handshake, with the fixed inputs, ready for NewSession on both sides.
+func finishedHandshake(t *testing.T) (alice, bob *Handshake) {
+	t.Helper()
+	alice, bob, response := aliceAfterResponse(t)
+	if err := alice.ConsumeResponse(response[:]); err != nil {
+		t.Fatalf("ConsumeResponse: %v", err)
+	}
+	return alice, bob
+}
+
+// newTestSession calls NewSession, failing the test on error.
+func newTestSession(t *testing.T, h *Handshake) *session.Session {
+	t.Helper()
+	s, err := h.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	return s
+}
+
+// checkSessions checks that a and b work as the two ends of a tunnel, and
+// that each message carries the receiver's index.
+func checkSessions(t *testing.T, a, b *session.Session, aIndex, bIndex uint32) {
+	t.Helper()
+	for _, dir := range []struct {
+		name     string
+		from, to *session.Session
+		toIndex  uint32
+	}{
+		{"initiator to responder", a, b, bIndex},
+		{"responder to initiator", b, a, aIndex},
+	} {
+		msg, err := dir.from.Seal(nil, []byte("packet"))
+		if err != nil {
+			t.Fatalf("%s: Seal: %v", dir.name, err)
+		}
+		if got := binary.LittleEndian.Uint32(msg[4:8]); got != dir.toIndex {
+			t.Errorf("%s: receiver index = %#x, want %#x", dir.name, got, dir.toIndex)
+		}
+		got, err := dir.to.Open(nil, msg)
+		if err != nil {
+			t.Fatalf("%s: Open: %v", dir.name, err)
+		}
+		if !bytes.Equal(got, []byte("packet")) {
+			t.Errorf("%s: Open = %q, want %q", dir.name, got, "packet")
+		}
+	}
+}
+
+// TestNewSession checks that the sessions of both sides work together, each
+// sealing with the key the other opens with and writing the other's index,
+// and that the handshake in progress is cleared, keeping only what lasts
+// across handshakes.
+func TestNewSession(t *testing.T) {
+	alice, bob := finishedHandshake(t)
+
+	aliceSession := newTestSession(t, alice)
+	bobSession := newTestSession(t, bob)
+	checkSessions(t, aliceSession, bobSession, testIndex, responderIndex)
+
+	for _, side := range []struct {
+		name string
+		h    *Handshake
+	}{
+		{"initiator", alice},
+		{"responder", bob},
+	} {
+		if side.h.state != nil || side.h.localEphemeral != nil || side.h.remoteEphemeral != nil {
+			t.Errorf("%s: the state and ephemeral keys were not cleared", side.name)
+		}
+		if side.h.stage != nothingStage {
+			t.Errorf("%s: stage = %d, want nothingStage", side.name, side.h.stage)
+		}
+		if side.h.localStatic == nil || side.h.remoteStatic == nil {
+			t.Errorf("%s: the static keys were cleared", side.name)
+		}
+	}
+	if want := tai64n(testTime); bob.lastTimestamp != want {
+		t.Errorf("lastTimestamp = %x, want %x, so old initiations could be replayed", bob.lastTimestamp, want)
+	}
+}
+
+// TestNewSessionTwice checks that a second call fails instead of returning
+// another session with the same keys, which would reuse nonces.
+func TestNewSessionTwice(t *testing.T) {
+	alice, bob := finishedHandshake(t)
+
+	for _, h := range []*Handshake{alice, bob} {
+		newTestSession(t, h)
+		if _, err := h.NewSession(); !errors.Is(err, errUnfinishedHandshake) {
+			t.Errorf("second NewSession error = %v, want %v", err, errUnfinishedHandshake)
+		}
+	}
+}
+
+// TestNewSessionUnfinished checks that NewSession fails at every stage
+// before the end, and leaves the handshake unchanged.
+func TestNewSessionUnfinished(t *testing.T) {
+	afterInitiation := initiatorHandshake(t)
+	createTestInitiation(t, afterInitiation)
+	_, afterConsuming := bobAfterInitiation(t)
+
+	tests := []struct {
+		name string
+		h    *Handshake
+	}{
+		{"new handshake", initiatorHandshake(t)},
+		{"after creating an initiation", afterInitiation},
+		{"after consuming an initiation", afterConsuming},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			before := *tc.h
+			if _, err := tc.h.NewSession(); !errors.Is(err, errUnfinishedHandshake) {
+				t.Fatalf("NewSession error = %v, want %v", err, errUnfinishedHandshake)
+			}
+			if *tc.h != before {
+				t.Error("a failed NewSession changed the handshake")
+			}
+		})
+	}
+}
+
+// TestHandshakeAgain checks that the same two handshakes can run a second
+// handshake after the first one gave its sessions, as a peer that starts
+// again must, and that the new sessions use new keys: a message from the
+// first sessions does not open with the second ones.
+func TestHandshakeAgain(t *testing.T) {
+	alice, bob := finishedHandshake(t)
+	oldAlice := newTestSession(t, alice)
+	newTestSession(t, bob)
+
+	// The second initiation needs a newer timestamp, or Bob rejects it as a
+	// replay.
+	initiation, err := alice.createInitiationWith(privateKey(t, ephemeralPrivate), testTime.Add(time.Second), testIndex+1)
+	if err != nil {
+		t.Fatalf("createInitiationWith: %v", err)
+	}
+	if err := bob.ConsumeInitiation(initiation[:]); err != nil {
+		t.Fatalf("ConsumeInitiation: %v", err)
+	}
+	response, err := bob.createResponseWith(privateKey(t, responderEphemeral), responderIndex+1)
+	if err != nil {
+		t.Fatalf("createResponseWith: %v", err)
+	}
+	if err := alice.ConsumeResponse(response[:]); err != nil {
+		t.Fatalf("ConsumeResponse: %v", err)
+	}
+
+	newAlice := newTestSession(t, alice)
+	newBob := newTestSession(t, bob)
+	checkSessions(t, newAlice, newBob, testIndex+1, responderIndex+1)
+
+	old, err := oldAlice.Seal(nil, []byte("packet"))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if _, err := newBob.Open(nil, old); err == nil {
+		t.Error("the new session opened a message from the old one")
+	}
+}
+
+// TestCreateReturnsNilOnError checks that CreateInitiation and CreateResponse
+// return no bytes with an error, so a caller that forgets the error has
+// nothing to send.
+func TestCreateReturnsNilOnError(t *testing.T) {
+	b, err := responderHandshake(t).CreateResponse()
+	if !errors.Is(err, errNoInitiation) {
+		t.Fatalf("CreateResponse error = %v, want %v", err, errNoInitiation)
+	}
+	if b != nil {
+		t.Errorf("CreateResponse returned %d bytes with an error, want nil", len(b))
+	}
+}
+
+// TestInitiating checks that Initiating is true only while this side waits
+// for the response to its initiation.
+func TestInitiating(t *testing.T) {
+	alice, bob := initiatorHandshake(t), responderHandshake(t)
+	if alice.Initiating() {
+		t.Error("Initiating = true before any initiation")
+	}
+
+	initiation, err := alice.CreateInitiation()
+	if err != nil {
+		t.Fatalf("CreateInitiation: %v", err)
+	}
+	if !alice.Initiating() {
+		t.Error("Initiating = false after CreateInitiation")
+	}
+
+	if err := bob.ConsumeInitiation(initiation); err != nil {
+		t.Fatalf("ConsumeInitiation: %v", err)
+	}
+	if bob.Initiating() {
+		t.Error("the responder's Initiating = true")
+	}
+	response, err := bob.CreateResponse()
+	if err != nil {
+		t.Fatalf("CreateResponse: %v", err)
+	}
+	if err := alice.ConsumeResponse(response); err != nil {
+		t.Fatalf("ConsumeResponse: %v", err)
+	}
+	if alice.Initiating() {
+		t.Error("Initiating = true after ConsumeResponse")
+	}
+}
+
+func TestHandshakePublicKeys(t *testing.T) {
+	alice := initiatorHandshake(t)
+	wantLocal := privateKey(t, alicePrivate).PublicKey().String()
+	wantPeer := privateKey(t, bobPrivate).PublicKey().String()
+
+	if got := alice.LocalPublicKey().String(); got != wantLocal {
+		t.Errorf("LocalPublicKey = %s, want %s", got, wantLocal)
+	}
+	if got := alice.PeerPublicKey().String(); got != wantPeer {
+		t.Errorf("PeerPublicKey = %s, want %s", got, wantPeer)
 	}
 }

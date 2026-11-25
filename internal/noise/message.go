@@ -11,10 +11,12 @@ import (
 
 // Message types, the first byte of each handshake message. The 3 bytes after
 // it are reserved and always zero, so the first 4 bytes read as a
-// little-endian uint32 equal the type.
+// little-endian uint32 equal the type. A receiver reads them to tell
+// handshake messages from transport data messages, whose type is
+// session.DataMessageType.
 const (
-	initiationType = 1
-	responseType   = 2
+	InitiationType = 1
+	ResponseType   = 2
 )
 
 // Sizes of the handshake messages, from section 5.4 of the whitepaper.
@@ -60,7 +62,7 @@ type initiationMessage struct {
 func (m *initiationMessage) marshal() [initiationSize]byte {
 	res := make([]byte, 0, initiationSize)
 	// The type as a little-endian uint32 also writes the 3 reserved zero bytes.
-	res = binary.LittleEndian.AppendUint32(res, initiationType)
+	res = binary.LittleEndian.AppendUint32(res, InitiationType)
 	res = binary.LittleEndian.AppendUint32(res, m.initiatorIndex)
 	res = append(res, m.ephemeral[:]...)
 	res = append(res, m.encryptedStatic[:]...)
@@ -83,7 +85,7 @@ func (m *initiationMessage) unmarshal(b []byte) error {
 		return errMessageSize
 	}
 
-	if binary.LittleEndian.Uint32(b) != initiationType {
+	if binary.LittleEndian.Uint32(b) != InitiationType {
 		return errMessageType
 	}
 	b = b[4:]
@@ -118,7 +120,7 @@ type responseMessage struct {
 func (m *responseMessage) marshal() [responseSize]byte {
 	res := make([]byte, 0, responseSize)
 	// The type as a little-endian uint32 also writes the 3 reserved zero bytes.
-	res = binary.LittleEndian.AppendUint32(res, responseType)
+	res = binary.LittleEndian.AppendUint32(res, ResponseType)
 	res = binary.LittleEndian.AppendUint32(res, m.responderIndex)
 	res = binary.LittleEndian.AppendUint32(res, m.initiatorIndex)
 	res = append(res, m.ephemeral[:]...)
@@ -141,7 +143,7 @@ func (m *responseMessage) unmarshal(b []byte) error {
 		return errMessageSize
 	}
 
-	if binary.LittleEndian.Uint32(b) != responseType {
+	if binary.LittleEndian.Uint32(b) != ResponseType {
 		return errMessageType
 	}
 	b = b[4:]
